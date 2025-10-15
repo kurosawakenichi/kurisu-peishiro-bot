@@ -1,201 +1,208 @@
+# main.py
+
 import discord
-from discord.ext import tasks
 from discord import app_commands
+from discord.ext import commands, tasks
 import os
 import json
-import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 
-intents = discord.Intents.default()
-intents.members = True
-
+# -------------------
+# 環境変数
+# -------------------
 TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = int(os.environ["GUILD_ID"])
 
-bot = discord.Client(intents=intents)
-tree = app_commands.CommandTree(bot)
+# -------------------
+# Intents
+# -------------------
+intents = discord.Intents.default()
+intents.members = True  # メンバー情報取得用
 
+bot = commands.Bot(command_prefix="/", intents=intents)
+tree = bot.tree
+
+# -------------------
+# プレイヤーデータ
+# -------------------
 PLAYERS_FILE = "players.json"
-EVENT_FILE = "event.json"
-MATCH_CHANNELS = ["beginner", "silver", "gold", "master", "groundmaster", "challenger", "free"]
 
-# 階級の範囲とアイコン
+if os.path.exists(PLAYERS_FILE):
+    with open(PLAYERS_FILE, "r", encoding="utf-8") as f:
+        players = json.load(f)
+else:
+    players = {}
+
+# -------------------
+# 階級定義
+# -------------------
 RANKS = [
-    (0, 4, "Beginner", "🔰"),
-    (5, 9, "Silver", "🥈"),
-    (10, 14, "Gold", "🥇"),
-    (15, 19, "Master", "⚔️"),
-    (20, 24, "GroundMaster", "🪽"),
-    (25, float('inf'), "Challenger", "😈")
+    (0, 4, "Beginner🔰"),
+    (5, 9, "Silver🥈"),
+    (10, 14, "Gold🥇"),
+    (15, 19, "Master⚔️"),
+    (20, 24, "GroundMaster🪽"),
+    (25, float("inf"), "Challenger😈"),
 ]
 
-# in-memory active matches: (winner_id, loser_id)
-active_matches = {}
+# -------------------
+# グローバル変数
+# -------------------
+event_start = None
+event_end = None
+pending_matches = {}  # 承認待ちのマッチング
 
-# JSON データ読み込み
-def load_json(filename):
-    try:
-        with open(filename, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-
-def save_json(filename, data):
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-players = load_json(PLAYERS_FILE)
-event_info = load_json(EVENT_FILE)
-
-# 階級アイコン取得
-def get_rank_icon(pt, challenge=False):
-    for low, high, _, icon in RANKS:
-        if low <= pt <= high:
-            return icon + ("🔥" if challenge else "")
-    return "❓"
-
-def get_rank_name(pt):
-    for low, high, name, _ in RANKS:
-        if low <= pt <= high:
+# -------------------
+# ユーティリティ
+# -------------------
+def get_rank(pt):
+    for min_pt, max_pt, name in RANKS:
+        if min_pt <= pt <= max_pt:
             return name
     return "Unknown"
 
-# ユーザー表示更新
-async def update_member_display(uid):
+async def update_member_display(user_id):
     guild = bot.get_guild(GUILD_ID)
-    member = guild.get_member(int(uid))
-    if member:
-        user_data = players.get(uid, {})
-        pt = user_data.get("pt", 0)
-        challenge = user_data.get("challenge", False)
-        rank_icon = get_rank_icon(pt, challenge)
-        rank_name = get_rank_name(pt)
-        try:
-            await member.edit(nick=f"{member.name} {rank_icon} {pt}pt")
-        except Exception:
-            pass
-
-# イベント期間判定
-def event_active():
-    if not event_info:
-        return False
-    now = datetime.utcnow()
-    start = datetime.fromisoformat(event_info["start"])
-    end = datetime.fromisoformat(event_info["end"])
-    return start <= now <= end
-
-# マッチング申請
-@tree.command(name="マッチング申請")
-async def matching_request(interaction: discord.Interaction, opponent: discord.User):
-    await interaction.response.defer(ephemeral=True)
-    if not event_active():
-        await interaction.followup.send("⚠️ イベント期間外です。", ephemeral=True)
+    member = guild.get_member(user_id)
+    if not member:
         return
-
-    winner_id = str(interaction.user.id)
-    loser_id = str(opponent.id)
-    key = (winner_id, loser_id)
-    if key in active_matches:
-        await interaction.followup.send("⚠️ このマッチングは既に申請済です。", ephemeral=True)
-        return
-
-    active_matches[key] = {"approved": False}
-    await interaction.followup.send(
-        f"@{opponent.name} へマッチング申請を送信しました。承認後に試合を行ってください。", ephemeral=True
-    )
-
-# 承認
-@tree.command(name="承認")
-async def approve_match(interaction: discord.Interaction, opponent: discord.User):
-    await interaction.response.defer(ephemeral=True)
-    loser_id = str(interaction.user.id)
-    winner_id = str(opponent.id)
-    key = (winner_id, loser_id)
-    if key not in active_matches:
-        await interaction.followup.send("⚠️ 該当マッチング申請が存在しません。", ephemeral=True)
-        return
-    active_matches[key]["approved"] = True
-    await interaction.followup.send("✅ マッチング申請を承認しました。", ephemeral=True)
-
-# 試合結果報告（勝者）
-@tree.command(name="試合結果報告")
-async def report(interaction: discord.Interaction, opponent: discord.User):
-    await interaction.response.defer(ephemeral=True)
-    winner_id = str(interaction.user.id)
-    loser_id = str(opponent.id)
-    key = (winner_id, loser_id)
-    if key not in active_matches or not active_matches[key].get("approved", False):
-        await interaction.followup.send(
-            "⚠️ 事前にマッチング申請・承認が完了していません。\n"
-            "問題がある場合は <@kurosawa0118> までご報告ください", ephemeral=True
-        )
-        return
-
-    # --- Pt 計算 ---
-    winner_data = players.get(winner_id, {"pt": 0, "challenge": False})
-    loser_data = players.get(loser_id, {"pt": 0, "challenge": False})
-
-    winner_pt = winner_data.get("pt",0)
-    loser_pt = loser_data.get("pt",0)
-
-    # 階級差
-    def calc_rank_diff(pt1, pt2):
-        rank1 = next(i for i, (low, high, _, _) in enumerate(RANKS) if low <= pt1 <= high)
-        rank2 = next(i for i, (low, high, _, _) in enumerate(RANKS) if low <= pt2 <= high)
-        return abs(rank1 - rank2)
-
-    diff = calc_rank_diff(winner_pt, loser_pt)
-    # 同階級 or 階級差あり
-    if diff == 0:
-        winner_pt +=1
-        loser_pt = max(loser_pt-1, 0)
-    else:
-        winner_pt += diff
-        loser_pt = max(loser_pt-1,0)
-
-    # 昇格チャレンジチェック
-    challenge_thresholds = [4,9,14,19,24]
-    winner_challenge = winner_pt in challenge_thresholds
-    loser_challenge = loser_pt in challenge_thresholds
-
-    players[winner_id] = {"pt": winner_pt, "challenge": winner_challenge}
-    players[loser_id] = {"pt": loser_pt, "challenge": loser_challenge}
-    save_json(PLAYERS_FILE, players)
-
-    # 非同期でメンバー表示更新
-    asyncio.create_task(update_member_display(winner_id))
-    asyncio.create_task(update_member_display(loser_id))
-
-    del active_matches[key]
-
-    # ランキングチャンネルに昇級アナウンス
-    guild = bot.get_guild(GUILD_ID)
-    rank_icon = get_rank_icon(winner_pt, winner_challenge)
-    channel = discord.utils.get(guild.text_channels, name="ランキング")
-    if channel:
-        asyncio.create_task(channel.send(f"🔥 <@{winner_id}> が {rank_icon} に昇級しました！"))
-
-    await interaction.followup.send("✅ 勝敗を反映しました。", ephemeral=True)
-
-# イベント設定
-@tree.command(name="イベント設定")
-async def event_setup(interaction: discord.Interaction, start: str, end: str):
-    await interaction.response.defer(ephemeral=True)
+    data = players.get(str(user_id), {"pt": 0, "challenge": False})
+    rank_name = get_rank(data["pt"])
+    challenge_icon = "🔥" if data.get("challenge", False) else ""
+    new_nick = f"{rank_name}{challenge_icon} {data['pt']}pt"
     try:
-        start_dt = datetime.fromisoformat(start)
-        end_dt = datetime.fromisoformat(end)
-    except ValueError:
-        await interaction.followup.send("⚠️ 日時の形式が正しくありません (例: 2025-10-15T14:00)", ephemeral=True)
-        return
-    global event_info
-    event_info = {"start": start, "end": end}
-    save_json(EVENT_FILE, event_info)
-    await interaction.followup.send(f"イベントを {start} 〜 {end} に設定しました", ephemeral=True)
+        await member.edit(nick=new_nick)
+    except Exception as e:
+        print(f"Failed to update nickname for {member}: {e}")
 
-# Bot 起動時
+def save_players():
+    with open(PLAYERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(players, f, ensure_ascii=False, indent=2)
+
+# -------------------
+# 定期ランキング投稿
+# -------------------
+@tasks.loop(minutes=1)
+async def ranking_post_loop():
+    if event_start is None or event_end is None:
+        return
+    now = datetime.now()
+    if now.hour in [14, 22] and now.minute == 0:
+        guild = bot.get_guild(GUILD_ID)
+        channel = discord.utils.get(guild.text_channels, name="ランキング")
+        if not channel:
+            return
+        ranking = sorted(players.items(), key=lambda x: x[1]["pt"], reverse=True)
+        msg = "**現在のランキング**\n"
+        for idx, (uid, data) in enumerate(ranking, start=1):
+            rank_name = get_rank(data["pt"])
+            challenge_icon = "🔥" if data.get("challenge", False) else ""
+            member = guild.get_member(int(uid))
+            if member:
+                msg += f"{idx}. {challenge_icon}{rank_name} {member.display_name} ({data['pt']}pt)\n"
+        await channel.send(msg)
+
+# -------------------
+# on_ready
+# -------------------
 @bot.event
 async def on_ready():
-    await tree.sync(guild=discord.Object(id=GUILD_ID))
     print(f"{bot.user} が起動しました。")
+    try:
+        synced = await tree.sync(guild=discord.Object(id=GUILD_ID))
+        print(f"Synced {len(synced)} commands")
+    except Exception as e:
+        print(f"Error syncing commands: {e}")
+    ranking_post_loop.start()
 
+# -------------------
+# /イベント設定
+# -------------------
+@tree.command(name="イベント設定", description="イベント期間を設定", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(start="開始日時 (例: 2025-10-15T14:00)", end="終了日時 (例: 2025-10-16T22:00)")
+async def event_setup(interaction: discord.Interaction, start: str, end: str):
+    global event_start, event_end
+    try:
+        event_start = datetime.fromisoformat(start)
+        event_end = datetime.fromisoformat(end)
+        await interaction.response.send_message(f"イベント期間を設定しました: {start} ～ {end}", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"日時の形式が不正です: {e}", ephemeral=True)
+
+# -------------------
+# /マッチング申請
+# -------------------
+@tree.command(name="マッチング申請", description="対戦相手にマッチング申請", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(opponent="対戦相手")
+async def match_request(interaction: discord.Interaction, opponent: discord.Member):
+    uid = str(interaction.user.id)
+    oid = str(opponent.id)
+    key = tuple(sorted([uid, oid]))
+    if key in pending_matches:
+        await interaction.response.send_message("既に承認待ちの申請があります。取り下げてください。", ephemeral=True)
+        return
+    pending_matches[key] = {"requester": uid, "approved": False}
+    await interaction.response.send_message(f"{opponent.mention} に承認を依頼しました。", ephemeral=True)
+
+# -------------------
+# /承認
+# -------------------
+@tree.command(name="承認", description="マッチング申請を承認", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(opponent="申請者")
+async def approve(interaction: discord.Interaction, opponent: discord.Member):
+    uid = str(interaction.user.id)
+    oid = str(opponent.id)
+    key = tuple(sorted([uid, oid]))
+    match = pending_matches.get(key)
+    if not match or match["approved"]:
+        await interaction.response.send_message("承認できる申請がありません。", ephemeral=True)
+        return
+    if match["requester"] == uid:
+        await interaction.response.send_message("自分の申請は承認できません。", ephemeral=True)
+        return
+    match["approved"] = True
+    await interaction.response.send_message("承認しました。", ephemeral=True)
+
+# -------------------
+# /試合結果報告
+# -------------------
+@tree.command(name="試合結果報告", description="勝者が試合結果を報告", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(opponent="対戦相手")
+async def report(interaction: discord.Interaction, opponent: discord.Member):
+    uid = str(interaction.user.id)
+    oid = str(opponent.id)
+    key = tuple(sorted([uid, oid]))
+    match = pending_matches.get(key)
+    if not match or not match["approved"]:
+        await interaction.response.send_message(f"事前にマッチング申請が承認されていません。\n@kurosawa0118 までご報告ください", ephemeral=True)
+        return
+
+    # プレイヤーデータ初期化
+    for id_ in [uid, oid]:
+        if id_ not in players:
+            players[id_] = {"pt":0, "challenge":False}
+
+    # Pt計算（簡易）
+    players[uid]["pt"] += 1
+    if players[oid]["pt"] > 0:
+        players[oid]["pt"] -= 1
+    save_players()
+
+    await update_member_display(int(uid))
+    await update_member_display(int(oid))
+
+    # 昇級通知
+    guild = bot.get_guild(GUILD_ID)
+    channel = discord.utils.get(guild.text_channels, name="ランキング")
+    if channel:
+        rank_name = get_rank(players[uid]["pt"])
+        challenge_icon = "🔥" if players[uid].get("challenge", False) else ""
+        await channel.send(f"{challenge_icon} <@{uid}> が昇級しました！ {rank_name} {players[uid]['pt']}pt")
+
+    del pending_matches[key]
+    await interaction.response.send_message("試合結果を反映しました。", ephemeral=True)
+
+# -------------------
+# Bot 起動
+# -------------------
 bot.run(TOKEN)
