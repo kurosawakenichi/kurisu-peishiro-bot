@@ -1,166 +1,167 @@
 import os
 import discord
-from discord import app_commands
 from discord.ext import commands, tasks
+from discord import app_commands
+from datetime import datetime, time, timedelta
 import asyncio
-from datetime import datetime, timedelta
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = int(os.environ["GUILD_ID"])
+RANKING_CHANNEL_ID = 1427542200614387846
 
 intents = discord.Intents.default()
-intents.members = True  # SERVER MEMBERS INTENT
-bot = commands.Bot(command_prefix="!", intents=intents)
+intents.members = True
+intents.message_content = True  # 推奨はPrivileged IntentをON
 
-# ----- データ管理 -----
-players = {}  # {user_id: {"pt": int, "challenge": bool}}
-matches = {}  # { (challenger_id, opponent_id): {"approved": bool} }
-event = {"start": None, "end": None, "active": False}
+bot = commands.Bot(command_prefix="/", intents=intents)
+tree = bot.tree
 
-# 階級定義
-RANKS = [
-    {"name": "Beginner", "min": 0, "max": 4, "icon": "🔰"},
-    {"name": "Silver", "min": 5, "max": 9, "icon": "🥈"},
-    {"name": "Gold", "min": 10, "max": 14, "icon": "🥇"},
-    {"name": "Master", "min": 15, "max": 19, "icon": "⚔️"},
-    {"name": "GroundMaster", "min": 20, "max": 24, "icon": "🪽"},
-    {"name": "Challenger", "min": 25, "max": 999, "icon": "😈"}
+# プレイヤーデータ
+players = {}
+
+# 階級設定
+rankings = [
+    {"name": "Beginner", "emoji": "🔰", "min_pt": 0, "max_pt": 4},
+    {"name": "Silver", "emoji": "🥈", "min_pt": 5, "max_pt": 9},
+    {"name": "Gold", "emoji": "🥇", "min_pt": 10, "max_pt": 14},
+    {"name": "Master", "emoji": "⚔️", "min_pt": 15, "max_pt": 19},
+    {"name": "GroundMaster", "emoji": "🪽", "min_pt": 20, "max_pt": 24},
+    {"name": "Challenger", "emoji": "😈", "min_pt": 25, "max_pt": 999},
 ]
 
-def get_rank(pt):
-    for rank in RANKS:
-        if rank["min"] <= pt <= rank["max"]:
-            return rank
-    return RANKS[0]
+event_active = False
+event_start = None
+event_end = None
 
-async def update_member_display(member: discord.Member):
-    """ユーザー名にptと階級アイコンを反映"""
-    info = players.get(member.id)
-    if info:
-        rank = get_rank(info["pt"])
-        challenge_icon = "🔥" if info["challenge"] else ""
-        new_name = f"{member.display_name.split(' ')[0]} {rank['icon']}{challenge_icon}{info['pt']}"
+# ============ ユーティリティ関数 ============
+
+def get_rank(pt):
+    for r in rankings:
+        if r["min_pt"] <= pt <= r["max_pt"]:
+            return r
+    return rankings[0]
+
+async def update_member_display(user_id):
+    member = bot.get_guild(GUILD_ID).get_member(user_id)
+    if member:
+        pt = players[user_id]["pt"]
+        rank = get_rank(pt)
+        challenge = "🔥" if players[user_id].get("challenge", False) else ""
+        new_name = f"{member.name} {rank['emoji']}{pt}{challenge}"
         try:
             await member.edit(nick=new_name)
-        except:
-            pass  # 権限がない場合は無視
+        except discord.Forbidden:
+            pass
 
-# ----- コマンド同期 -----
-@bot.event
-async def on_ready():
-    print(f"[INFO] {bot.user} is ready.")
-    guild = discord.Object(id=GUILD_ID)
-    await bot.tree.sync(guild=guild)
-    print("[INFO] ギルドコマンド同期完了")
-    ranking_post.start()
+# ============ イベント設定（管理者のみ） ============
 
-# ----- イベント管理 -----
-@bot.tree.command(name="イベント設定", description="イベント開始/終了日時を設定", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(start="開始日時 YYYY-MM-DD HH:MM", end="終了日時 YYYY-MM-DD HH:MM")
+@tree.command(name="イベント設定", description="イベントの開始・終了日時を設定", guild=discord.Object(id=GUILD_ID))
+@app_commands.checks.has_permissions(administrator=True)
 async def set_event(interaction: discord.Interaction, start: str, end: str):
-    try:
-        event["start"] = datetime.strptime(start, "%Y-%m-%d %H:%M")
-        event["end"] = datetime.strptime(end, "%Y-%m-%d %H:%M")
-        event["active"] = True
-        await interaction.response.send_message(f"イベント設定完了:\n開始: {event['start']}\n終了: {event['end']}", ephemeral=True)
-    except Exception as e:
-        await interaction.response.send_message(f"日時形式エラー: {e}", ephemeral=True)
+    global event_active, event_start, event_end
+    # ISO形式で受け取り
+    event_start = datetime.fromisoformat(start)
+    event_end = datetime.fromisoformat(end)
+    event_active = True
+    await interaction.response.send_message(f"イベント設定完了: {event_start} 〜 {event_end}")
 
-# ----- マッチング申請 -----
-@bot.tree.command(name="マッチング申請", description="対戦相手に申請", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(opponent="対戦相手")
+# ============ マッチング申請 ============
+
+match_requests = {}  # {challenger_id: opponent_id}
+
+@tree.command(name="マッチング申請", description="対戦申請を送る", guild=discord.Object(id=GUILD_ID))
 async def match_request(interaction: discord.Interaction, opponent: discord.Member):
-    if not event["active"]:
-        await interaction.response.send_message("イベントが設定されていません。", ephemeral=True)
+    if not event_active:
+        await interaction.response.send_message("イベントは未開始です")
         return
-    if (interaction.user.id, opponent.id) in matches:
-        await interaction.response.send_message("すでに申請済みです。", ephemeral=True)
+    uid = interaction.user.id
+    if uid in match_requests:
+        await interaction.response.send_message("既に申請中です")
         return
-    matches[(interaction.user.id, opponent.id)] = {"approved": False}
-    # 承認ボタン付きメッセージ送信
-    view = discord.ui.View()
-    async def approve_callback(button_interaction: discord.Interaction):
-        matches[(interaction.user.id, opponent.id)]["approved"] = True
-        await button_interaction.response.send_message("承認されました！", ephemeral=True)
-    button = discord.ui.Button(label="承認", style=discord.ButtonStyle.green)
-    button.callback = approve_callback
-    view.add_item(button)
-    await interaction.response.send_message(f"{opponent.mention} にマッチング申請しました。承認を待ってください。", view=view, ephemeral=True)
+    match_requests[uid] = opponent.id
+    # ボタン作成
+    class ApproveButton(discord.ui.View):
+        @discord.ui.button(label="承認", style=discord.ButtonStyle.green)
+        async def approve(self, button: discord.ui.Button, button_interaction: discord.Interaction):
+            if button_interaction.user.id != opponent.id:
+                await button_interaction.response.send_message("あなたは承認できません", ephemeral=True)
+                return
+            await interaction.user.send(f"{opponent.name}が承認しました")
+            await button_interaction.response.send_message("承認完了", ephemeral=True)
+    view = ApproveButton()
+    await interaction.response.send_message(f"{opponent.name}にマッチング申請しました。承認を待ってください。", view=view, ephemeral=True)
 
-# ----- 試合結果報告 -----
-@bot.tree.command(name="試合結果報告", description="勝者が報告", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(opponent="対戦相手")
-async def report_result(interaction: discord.Interaction, opponent: discord.Member):
-    key = (interaction.user.id, opponent.id)
-    match = matches.get(key)
-    if not match or not match["approved"]:
-        await interaction.response.send_message("マッチング承認が完了していません。", ephemeral=True)
-        return
-    await interaction.response.send_message("承認待ちです…", ephemeral=True)
-    # バックグラウンドで pt 更新
-    async def update_pt():
-        # プレイヤー情報初期化
-        for uid in [interaction.user.id, opponent.id]:
-            if uid not in players:
-                players[uid] = {"pt":0, "challenge":False}
-        winner_id = interaction.user.id
-        loser_id = opponent.id
-        winner_info = players[winner_id]
-        loser_info = players[loser_id]
-        # 同階級判定
-        winner_rank = get_rank(winner_info["pt"])
-        loser_rank = get_rank(loser_info["pt"])
-        diff = (loser_rank["min"] - winner_rank["min"]) // 5
-        # Pt計算
-        if diff >= 3:
-            await interaction.followup.send(f"マッチング不可の差があります。", ephemeral=True)
-            return
-        # 勝者+1〜階級差補正
-        gain = 1 + max(diff,0)
-        # 敗者-1〜階級差補正
-        loss = -1 - max(-diff,0)
-        winner_info["pt"] += gain
-        loser_info["pt"] = max(0, loser_info["pt"] + loss)
-        # 昇級チャレンジ判定
-        for uid in [winner_id, loser_id]:
-            info = players[uid]
-            rank = get_rank(info["pt"])
-            info["challenge"] = False
-            for r in RANKS[:-1]:
-                if info["pt"] == r["max"]:
-                    info["challenge"] = True
-        # ユーザー名更新
-        guild = bot.get_guild(GUILD_ID)
-        for uid in [winner_id, loser_id]:
-            member = guild.get_member(uid)
-            if member:
-                await update_member_display(member)
-        # ランキング投稿
-        await post_ranking()
-    asyncio.create_task(update_pt())
+# ============ 試合結果報告 ============
 
-# ----- ランキング投稿 -----
-ranking_channel_id = 1427542200614387846  # #ランキングチャンネルIDをセット
+@tree.command(name="試合結果報告", description="勝敗報告", guild=discord.Object(id=GUILD_ID))
+async def report_result(interaction: discord.Interaction, winner: discord.Member, loser: discord.Member):
+    uid_w = winner.id
+    uid_l = loser.id
+    if match_requests.get(uid_w) != uid_l:
+        await interaction.response.send_message("マッチング申請・承認済みではありません", ephemeral=True)
+        return
+    # pt計算
+    for uid in [uid_w, uid_l]:
+        if uid not in players:
+            players[uid] = {"pt":0}
+    players[uid_w]["pt"] += 1
+    players[uid_l]["pt"] = max(players[uid_l]["pt"] - 1, 0)
+    # 昇格チャレンジ判定
+    for uid in [uid_w, uid_l]:
+        pt = players[uid]["pt"]
+        if pt in [4,9,14,19,24]:
+            players[uid]["challenge"] = True
+        else:
+            players[uid]["challenge"] = False
+    # ニックネーム更新
+    await update_member_display(uid_w)
+    await update_member_display(uid_l)
+    await interaction.response.send_message(f"{winner.name} が勝利しました。pt反映済み。")
+
+# ============ ランキング表示 ============
 
 async def post_ranking():
-    guild = bot.get_guild(GUILD_ID)
-    if not guild:
-        return
-    ch = guild.get_channel(ranking_channel_id)
-    if not ch:
-        return
-    text = "**ランキング**\n"
-    sorted_players = sorted(players.items(), key=lambda x:x[1]["pt"], reverse=True)
-    for uid, info in sorted_players:
-        rank = get_rank(info["pt"])
-        challenge_icon = "🔥" if info["challenge"] else ""
-        member = guild.get_member(uid)
-        name = member.display_name if member else str(uid)
-        text += f"{rank['icon']}{challenge_icon}{info['pt']} {name}\n"
-    await ch.send(text)
+    channel = bot.get_channel(RANKING_CHANNEL_ID)
+    lines = []
+    for uid, data in sorted(players.items(), key=lambda x: -x[1]["pt"]):
+        member = bot.get_guild(GUILD_ID).get_member(uid)
+        if member:
+            rank = get_rank(data["pt"])
+            challenge = "🔥" if data.get("challenge", False) else ""
+            lines.append(f"{member.name} {rank['emoji']}{data['pt']}{challenge}")
+    text = "\n".join(lines)
+    await channel.send(f"ランキング\n{text}")
 
-@tasks.loop(minutes=5)
-async def ranking_post():
+@tasks.loop(time=[time(13,0), time(22,0)])
+async def auto_post_ranking():
     await post_ranking()
+
+# ============ 管理者コマンド ============
+
+@tree.command(name="pt操作", description="管理者がptを操作", guild=discord.Object(id=GUILD_ID))
+@app_commands.checks.has_permissions(administrator=True)
+async def admin_pt(interaction: discord.Interaction, member: discord.Member, pt: int):
+    players[member.id] = {"pt":pt}
+    await update_member_display(member.id)
+    await interaction.response.send_message(f"{member.name}のptを{pt}に設定しました")
+
+@tree.command(name="ランキングリセット", description="ランキングを初期化", guild=discord.Object(id=GUILD_ID))
+@app_commands.checks.has_permissions(administrator=True)
+async def reset_ranking(interaction: discord.Interaction):
+    global players
+    players = {}
+    await interaction.response.send_message("ランキングをリセットしました")
+
+# ============ 起動処理 ============
+
+@bot.event
+async def on_ready():
+    print(f"{bot.user} is ready.")
+    try:
+        await tree.sync(guild=discord.Object(id=GUILD_ID))
+        print("ギルドコマンド同期完了")
+    except Exception as e:
+        print("コマンド同期エラー:", e)
+    auto_post_ranking.start()
 
 bot.run(TOKEN)
