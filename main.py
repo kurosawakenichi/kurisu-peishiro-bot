@@ -35,7 +35,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # ==============================
 players = {}  # user_id: {"pt": int, "challenge": bool}
 pending_matches = {}  # user_id: opponent_id
-awaiting_results = {}  # winner_id: loser_id, timer_task
+awaiting_results = {}  # winner_id: {"loser_id": int, "timer_task": asyncio.Task}
 
 # ==============================
 # 階級定義
@@ -143,24 +143,24 @@ async def matching_request(interaction: discord.Interaction, opponent: discord.M
 # ==============================
 # /承認
 # ==============================
-@bot.tree.command(name="承認", description="対戦申請を承認する")
+@bot.tree.command(name="承認", description="対戦申請を承認する / 試合結果を承認する")
 async def approve(interaction: discord.Interaction):
     user = interaction.user
+    # マッチング承認
     opponent_id = next((uid for uid, oid in pending_matches.items() if oid == user.id), None)
-    if not opponent_id:
-        # 敗者承認かもしれない
-        if any(wid for wid, lid in awaiting_results.items() if lid == user.id):
-            # 承認処理
-            winner_id = next(wid for wid, lid in awaiting_results.items() if lid == user.id)
-            await finalize_match(winner_id, user.id)
-            await interaction.response.send_message("✅ 対戦結果を承認しました。")
-            return
-        await interaction.response.send_message("承認待ち申請はありません。", ephemeral=True)
+    if opponent_id:
+        opponent = bot.get_user(opponent_id)
+        del pending_matches[opponent_id]
+        awaiting_results[opponent_id] = {"loser_id": user.id, "timer_task": None}
+        await interaction.response.send_message(f"✅ {user.mention} が {opponent.mention} の対戦申請を承認しました。")
         return
-    opponent = bot.get_user(opponent_id)
-    del pending_matches[opponent_id]
-    awaiting_results[opponent_id] = user.id
-    await interaction.response.send_message(f"✅ {user.mention} が {opponent.mention} の対戦申請を承認しました。")
+    # 勝者報告後の承認
+    winner_id = next((wid for wid, info in awaiting_results.items() if info["loser_id"] == user.id), None)
+    if winner_id:
+        await finalize_match(winner_id, user.id)
+        await interaction.response.send_message("✅ 対戦結果を承認しました。")
+        return
+    await interaction.response.send_message("承認待ち申請はありません。", ephemeral=True)
 
 
 # ==============================
@@ -170,12 +170,12 @@ async def approve(interaction: discord.Interaction):
 async def reject(interaction: discord.Interaction):
     user = interaction.user
     opponent_id = next((uid for uid, oid in pending_matches.items() if oid == user.id), None)
-    if not opponent_id:
-        await interaction.response.send_message("辞退対象の申請はありません。", ephemeral=True)
+    if opponent_id:
+        opponent = bot.get_user(opponent_id)
+        del pending_matches[opponent_id]
+        await interaction.response.send_message(f"❌ {user.mention} が {opponent.mention} の申請を拒否しました。")
         return
-    opponent = bot.get_user(opponent_id)
-    del pending_matches[opponent_id]
-    await interaction.response.send_message(f"❌ {user.mention} が {opponent.mention} の申請を拒否しました。")
+    await interaction.response.send_message("辞退対象の申請はありません。", ephemeral=True)
 
 
 # ==============================
@@ -185,11 +185,12 @@ async def reject(interaction: discord.Interaction):
 @app_commands.describe(opponent="対戦相手")
 async def report_result(interaction: discord.Interaction, opponent: discord.Member):
     winner = interaction.user
-    if winner.id not in awaiting_results or awaiting_results[winner.id] != opponent.id:
+    if winner.id not in awaiting_results or awaiting_results[winner.id]["loser_id"] != opponent.id:
         await interaction.response.send_message(
             f"この対戦は成立していません。{ADMIN_MENTION} へご報告ください。", ephemeral=True
         )
         return
+
     # 15分承認待ち
     async def auto_finalize():
         await asyncio.sleep(900)
@@ -198,19 +199,30 @@ async def report_result(interaction: discord.Interaction, opponent: discord.Memb
             chan = bot.get_channel(RANKING_CHANNEL_ID)
             if chan:
                 await chan.send(f"⏰ {winner.mention} の試合が15分経過により自動承認されました。")
+
     task = asyncio.create_task(auto_finalize())
-    awaiting_results[winner.id] = {"loser_id": opponent.id, "timer_task": task}
+    awaiting_results[winner.id]["timer_task"] = task
+
     await interaction.response.send_message(
         f"勝者報告完了。敗者 {opponent.mention} が `/承認` するか、15分で自動承認されます。"
     )
 
 
+# ==============================
+# 対戦結果処理
+# ==============================
 async def finalize_match(winner_id, loser_id):
+    # データ初期化
     data_w = players.setdefault(winner_id, {"pt": 0, "challenge": False})
     data_l = players.setdefault(loser_id, {"pt": 0, "challenge": False})
+
     winner_pt = data_w["pt"]
     loser_pt = data_l["pt"]
+
+    # 階級差
     diff = abs(rank_difference(winner_pt, loser_pt))
+
+    # Pt計算
     if diff == 0:
         winner_pt += 1
         loser_pt = max(loser_pt - 1, 0)
@@ -221,19 +233,17 @@ async def finalize_match(winner_id, loser_id):
         else:
             winner_pt += 1
             loser_pt = max(loser_pt - 1 - diff, 0)
+
+    # Gold到達後の降格制限
     if data_l["pt"] >= 10 and loser_pt < 10:
         loser_pt = 10
+
+    # Pt更新
     data_w["pt"] = winner_pt
     data_l["pt"] = loser_pt
+
     # 昇格チャレンジ判定
     for uid in [winner_id, loser_id]:
         pt = players[uid]["pt"]
         players[uid]["challenge"] = pt in [4, 9, 14, 19, 24]
-        await update_member_display(uid)
-     # 昇格アナウンス
-    chan = bot.get_channel(RANKING_CHANNEL_ID)
-    if chan:
-        rank_name, emoji = get_rank(players[winner_id]["pt"])
-        challenge_mark = "🔥" if players[winner_id]["challenge"] else ""
-        member = bot.get_user(winner_id)
-        await chan.send(f"🔥 {member.mention} が {rank_name}{emoji}{challenge_mark} に昇級しました！")
+        await update_member_display(uid
