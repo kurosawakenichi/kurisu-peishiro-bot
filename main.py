@@ -112,6 +112,7 @@ async def ランキングリセット(interaction: discord.Interaction):
 @bot.event
 async def on_ready():
     print(f"[INFO] {bot.user} is ready.")
+
     guild = None
     for attempt in range(15):
         guild = bot.get_guild(GUILD_ID)
@@ -127,11 +128,19 @@ async def on_ready():
 
     try:
         print("[INFO] 旧コマンドを全削除中...")
-        bot.tree.clear_commands(guild=None)  # ✅ 全サーバーの登録コマンドを一度削除
-        bot.tree.clear_commands(guild=discord.Object(id=GUILD_ID))  # ✅ ギルド登録分も削除
+        bot.tree.clear_commands(guild=None)
+        bot.tree.clear_commands(guild=discord.Object(id=GUILD_ID))
         await bot.tree.sync(guild=None)
         await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
-        print("[INFO] 全コマンド再同期完了")
+        print("[INFO] 全削除完了")
+
+        # ✅ 新しいコマンドを再登録
+        print("[INFO] 新しいコマンドを登録中...")
+        for cmd in bot.tree.get_commands():
+            print(f"  登録済: /{cmd.name}")
+        await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
+        print("[INFO] 新しいコマンド同期完了")
+
     except Exception:
         print("[ERROR] コマンド同期中にエラー発生:")
         traceback.print_exc()
