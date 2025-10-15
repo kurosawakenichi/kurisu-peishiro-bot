@@ -124,18 +124,14 @@ async def on_ready():
         except Exception:
             pass
         await asyncio.sleep(1)
-    if not guild:
-        print(f"[WARN] ギルド {GUILD_ID} が取得できませんでした。コマンド同期をスキップします。")
-        if not ranking_poster.is_running():
-            ranking_poster.start()
-        return
 
     try:
-        print("[INFO] ギルドコマンドをクリア＆同期します...")
-        # ✅ clear_commands は await 不要
-        bot.tree.clear_commands(guild=discord.Object(id=GUILD_ID))
+        print("[INFO] 旧コマンドを全削除中...")
+        bot.tree.clear_commands(guild=None)  # ✅ 全サーバーの登録コマンドを一度削除
+        bot.tree.clear_commands(guild=discord.Object(id=GUILD_ID))  # ✅ ギルド登録分も削除
+        await bot.tree.sync(guild=None)
         await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
-        print("[INFO] ギルドコマンド同期完了")
+        print("[INFO] 全コマンド再同期完了")
     except Exception:
         print("[ERROR] コマンド同期中にエラー発生:")
         traceback.print_exc()
@@ -145,6 +141,7 @@ async def on_ready():
         ranking_poster.start()
 
     print(f"✅ {bot.user} が起動しました。")
+
 
 # ============================================================
 
