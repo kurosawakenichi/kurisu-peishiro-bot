@@ -230,8 +230,10 @@ async def finalize_match(winner_id, loser_id):
         pt = players[uid]["pt"]
         players[uid]["challenge"] = pt in [4, 9, 14, 19, 24]
         await update_member_display(uid)
-    # 昇格アナウンス
+     # 昇格アナウンス
     chan = bot.get_channel(RANKING_CHANNEL_ID)
     if chan:
-        rank, emoji = get_rank(players[winner_id]["pt"])
-        challenge = "🔥" if players[winner_id]["challenge
+        rank_name, emoji = get_rank(players[winner_id]["pt"])
+        challenge_mark = "🔥" if players[winner_id]["challenge"] else ""
+        member = bot.get_user(winner_id)
+        await chan.send(f"🔥 {member.mention} が {rank_name}{emoji}{challenge_mark} に昇級しました！")
