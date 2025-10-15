@@ -1,157 +1,168 @@
-import os
-import json
-import asyncio
 import discord
 from discord.ext import commands, tasks
+from discord import app_commands
+import asyncio
+import os
 from datetime import datetime, timedelta
-import traceback
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = int(os.environ["GUILD_ID"])
 
 intents = discord.Intents.default()
 intents.members = True
-intents.guilds = True
-
 bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
 
-STATE_FILE = "state.json"
+# ----- プレイヤー情報管理 -----
+# JSONではなく既存方式。参加中にメモリ上で管理
+players = {}  # user_id: { "pt": 0, "rank": "Beginner", "challenge": False, "max_pt": 0 }
 
-# ============================================================
-# 状態管理
-# ============================================================
+RANKS = [
+    (0, 4, "Beginner", "🔰"),
+    (5, 9, "Silver", "🥈"),
+    (10, 14, "Gold", "🥇"),
+    (15, 19, "Master", "⚔️"),
+    (20, 24, "GroundMaster", "🪽"),
+    (25, float('inf'), "Challenger", "😈")
+]
 
-state = {
-    "players": {},
-    "event_start": None,
-    "event_end": None,
-    "ranking_channel": None,
-}
+# ----- ユーティリティ関数 -----
+def get_rank(pt):
+    for low, high, name, emoji in RANKS:
+        if low <= pt <= high:
+            return name, emoji
+    return "Beginner", "🔰"
 
-def save_state():
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=4)
-
-def load_state():
+async def update_member_display(user: discord.Member):
+    pdata = players.get(user.id)
+    if not pdata:
+        return
+    rank_name, rank_emoji = get_rank(pdata["pt"])
+    challenge_icon = "🔥" if pdata.get("challenge") else ""
+    new_nick = f"{rank_emoji}{challenge_icon} {user.name} ({pdata['pt']}pt)"
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            state.update(data)
-    except FileNotFoundError:
+        await user.edit(nick=new_nick)
+    except discord.Forbidden:
         pass
 
-# ============================================================
-# ランキング自動投稿
-# ============================================================
+def adjust_pt(winner_id, loser_id):
+    winner = players[winner_id]
+    loser = players[loser_id]
 
-@tasks.loop(hours=8)
-async def ranking_poster():
-    if not state["ranking_channel"]:
-        return
-    now = datetime.now()
-    if state["event_start"] and state["event_end"]:
-        if not (state["event_start"] <= now <= state["event_end"]):
+    # 階級差計算
+    winner_rank_idx = next(i for i,r in enumerate(RANKS) if r[2]==get_rank(winner['pt'])[0])
+    loser_rank_idx = next(i for i,r in enumerate(RANKS) if r[2]==get_rank(loser['pt'])[0])
+    diff = abs(winner_rank_idx - loser_rank_idx)
+
+    # PT計算
+    if winner_rank_idx == loser_rank_idx:
+        winner['pt'] += 1
+        loser['pt'] = max(0, loser['pt'] - 1)
+    elif winner_rank_idx < loser_rank_idx:
+        winner['pt'] += 1 + diff
+        loser['pt'] = max(0, loser['pt'] - 1)
+    else:
+        winner['pt'] += 1
+        loser['pt'] = max(0, loser['pt'] - 1 - diff)
+
+    # 最大PT更新
+    if winner['pt'] > winner.get('max_pt',0):
+        winner['max_pt'] = winner['pt']
+
+    # 昇級チャレンジ判定
+    for threshold in [4, 9, 14, 19, 24]:
+        if winner['pt'] == threshold:
+            winner['challenge'] = True
+            break
+
+# ----- マッチング管理 -----
+match_requests = {}  # user_id: target_id
+pending_approval = {}  # winner_id: loser_id
+
+# ----- コマンド登録 -----
+def register_commands():
+    @tree.command(name="イベント設定", description="イベント開始・終了日時を設定")
+    @app_commands.describe(開始="開始日時 (YYYY-MM-DD HH:MM)", 終了="終了日時 (YYYY-MM-DD HH:MM)")
+    async def イベント設定(interaction: discord.Interaction, 開始: str, 終了: str):
+        await interaction.response.send_message(f"イベントを {開始} 〜 {終了} に設定しました", ephemeral=True)
+
+    @tree.command(name="ランキングリセット", description="ランキングをリセット")
+    async def ランキングリセット(interaction: discord.Interaction):
+        for uid in players:
+            players[uid]['pt'] = 0
+            players[uid]['challenge'] = False
+        await interaction.response.send_message("ランキングをリセットしました", ephemeral=True)
+
+    @tree.command(name="マッチング申請", description="対戦相手を申請")
+    @app_commands.describe(相手="対戦相手を指定")
+    async def マッチング申請(interaction: discord.Interaction, 相手: discord.Member):
+        uid = interaction.user.id
+        tid = 相手.id
+        if uid in match_requests or tid in match_requests.values():
+            await interaction.response.send_message("すでにマッチング申請中です", ephemeral=True)
             return
-    guild = bot.get_guild(GUILD_ID)
-    if not guild:
-        return
-    channel = guild.get_channel(state["ranking_channel"])
-    if not channel:
-        return
-    sorted_players = sorted(
-        state["players"].items(),
-        key=lambda x: x[1]["pt"],
-        reverse=True
-    )
-    if not sorted_players:
-        await channel.send("まだランキングはありません。")
-        return
-    lines = ["🏆 現在のランキング 🏆\n"]
-    for i, (uid, info) in enumerate(sorted_players, 1):
-        member = guild.get_member(int(uid))
-        name = member.display_name if member else f"ユーザーID:{uid}"
-        lines.append(f"{i}. {name} - {info['pt']}pt")
-    await channel.send("\n".join(lines))
+        match_requests[uid] = tid
+        await interaction.response.send_message(f"{相手.display_name} に対戦申請しました。承認待ちです", ephemeral=True)
 
-# ============================================================
-# コマンド群
-# ============================================================
+    @tree.command(name="承認", description="対戦申請を承認")
+    async def 承認(interaction: discord.Interaction):
+        uid = interaction.user.id
+        found = None
+        for winner, loser in match_requests.items():
+            if loser == uid:
+                found = (winner, loser)
+                break
+        if not found:
+            await interaction.response.send_message("承認対象の申請がありません", ephemeral=True)
+            return
+        winner, loser = found
+        pending_approval[winner] = loser
+        del match_requests[winner]
+        await interaction.response.send_message("承認しました。勝者が /試合結果報告 で報告可能です", ephemeral=True)
 
-@bot.tree.command(name="イベント設定", description="イベントの開始・終了・ランキングチャンネルを設定します（管理者専用）")
-@commands.has_permissions(administrator=True)
-async def イベント設定(interaction: discord.Interaction, 
-                 start: str, end: str, ranking_channel: discord.TextChannel):
-    """
-    例: /イベント設定 start:2025-10-15T00:00 end:2025-10-20T23:59 ranking_channel:#ランキング
-    """
-    try:
-        start_dt = datetime.fromisoformat(start)
-        end_dt = datetime.fromisoformat(end)
-        state["event_start"] = start_dt
-        state["event_end"] = end_dt
-        state["ranking_channel"] = ranking_channel.id
-        save_state()
-        await interaction.response.send_message(
-            f"✅ イベントを設定しました。\n開始: {start_dt}\n終了: {end_dt}\nランキングチャンネル: {ranking_channel.mention}",
-            ephemeral=True
-        )
-    except Exception as e:
-        await interaction.response.send_message(f"エラーが発生しました: {e}", ephemeral=True)
+    @tree.command(name="試合結果報告", description="試合結果を報告")
+    async def 試合結果報告(interaction: discord.Interaction):
+        winner_id = interaction.user.id
+        if winner_id not in pending_approval:
+            await interaction.response.send_message(f"承認済の申請がありません。@kurosawa0118 に連絡してください", ephemeral=True)
+            return
+        loser_id = pending_approval[winner_id]
+        adjust_pt(winner_id, loser_id)
+        del pending_approval[winner_id]
 
-@bot.tree.command(name="ランキングリセット", description="ランキングデータを全リセットします（管理者専用）")
-@commands.has_permissions(administrator=True)
-async def ランキングリセット(interaction: discord.Interaction):
-    state["players"].clear()
-    save_state()
-    await interaction.response.send_message("ランキングをリセットしました。", ephemeral=True)
+        winner = bot.get_user(winner_id)
+        loser = bot.get_user(loser_id)
+        # ロール・名前更新
+        await update_member_display(winner)
+        await update_member_display(loser)
+        # ランキングチャンネル告知
+        guild = bot.get_guild(GUILD_ID)
+        ranking_channel = discord.utils.get(guild.text_channels, name="ランキング")
+        rank_name, rank_emoji = get_rank(players[winner_id]['pt'])
+        await ranking_channel.send(f"🔥 {winner.mention} が {rank_name}{rank_emoji} に昇級しました！")
 
-# ============================================================
-# 起動イベント
-# ============================================================
+        await interaction.response.send_message(f"{winner.display_name} vs {loser.display_name} の結果を反映しました", ephemeral=True)
 
+# ----- 起動処理 -----
 @bot.event
 async def on_ready():
     print(f"[INFO] {bot.user} is ready.")
 
-    guild = None
-    for attempt in range(15):
-        guild = bot.get_guild(GUILD_ID)
-        if guild:
-            break
-        try:
-            guild = await bot.fetch_guild(GUILD_ID)
-            if guild:
-                break
-        except Exception:
-            pass
-        await asyncio.sleep(1)
-
+    guild = discord.Object(id=GUILD_ID)
     try:
-        print("[INFO] 旧コマンドを全削除中...")
-        bot.tree.clear_commands(guild=None)
-        bot.tree.clear_commands(guild=discord.Object(id=GUILD_ID))
-        await bot.tree.sync(guild=None)
-        await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
-        print("[INFO] 全削除完了")
-
-        # ✅ 新しいコマンドを再登録
-        print("[INFO] 新しいコマンドを登録中...")
-        for cmd in bot.tree.get_commands():
-            print(f"  登録済: /{cmd.name}")
-        await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
-        print("[INFO] 新しいコマンド同期完了")
-
-    except Exception:
-        print("[ERROR] コマンド同期中にエラー発生:")
-        traceback.print_exc()
-
-    load_state()
-    if not ranking_poster.is_running():
-        ranking_poster.start()
+        print("[INFO] ギルドコマンド全削除＆再同期中...")
+        await tree.clear_commands(guild=guild)
+        await tree.sync(guild=guild)
+        await tree.sync()
+        register_commands()
+        await tree.sync(guild=guild)
+        print("[INFO] コマンド同期完了 ✅")
+    except Exception as e:
+        print("[ERROR] コマンド同期中にエラー発生:", e)
 
     print(f"✅ {bot.user} が起動しました。")
 
-
-# ============================================================
-
-bot.run(TOKEN)
+# ----- 実行 -----
+if __name__ == "__main__":
+    print("[START] Bot starting...")
+    bot.run(TOKEN)
