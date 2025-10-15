@@ -246,4 +246,4 @@ async def finalize_match(winner_id, loser_id):
     for uid in [winner_id, loser_id]:
         pt = players[uid]["pt"]
         players[uid]["challenge"] = pt in [4, 9, 14, 19, 24]
-        await update_member_display(uid
+        await update_member_display(uid) 
