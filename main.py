@@ -1,47 +1,33 @@
 import discord
+from discord.ext import tasks
 from discord import app_commands
-from discord.ext import commands, tasks
 import asyncio
+from datetime import datetime, time, timedelta
 import os
-from datetime import datetime, timedelta, time as dt_time
-from collections import defaultdict
 
 # ----------------------------------------
 # 環境変数
 # ----------------------------------------
-ADMIN_ID = int(os.environ["ADMIN_ID"])
-DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-GUILD_ID = int(os.environ["GUILD_ID"])
-RANKING_CHANNEL_ID = int(os.environ["RANKING_CHANNEL_ID"])
-JUDGE_CHANNEL_ID = int(os.environ.get("JUDGE_CHANNEL_ID", 0))  # 任意
-
-# ----------------------------------------
-# Bot初期化
-# ----------------------------------------
-intents = discord.Intents.default()
-intents.guilds = True
-intents.members = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+ADMIN_ID = int(os.environ.get("ADMIN_ID"))
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
+GUILD_ID = int(os.environ.get("GUILD_ID"))
+RANKING_CHANNEL_ID = int(os.environ.get("RANKING_CHANNEL_ID"))
+JUDGE_CHANNEL_ID = int(os.environ.get("JUDGE_CHANNEL_ID"))
 
 # ----------------------------------------
 # 定数
 # ----------------------------------------
-AUTO_APPROVE_SECONDS = 15*60  # 15分
+AUTO_APPROVE_SECONDS = 15 * 60  # 15分で自動承認
 
 # ----------------------------------------
-# ユーザーデータ
-# {user_id: {"pt": int}}
+# データ
 # ----------------------------------------
-user_data = {}
-
-# マッチング情報
-# {user_id: opponent_id}
-matching = {}
+user_data = {}   # {user_id: {"pt": int}}
+matching = {}    # {user_id: opponent_id}
 
 # ----------------------------------------
 # ランク定義（表示用）
 # 各タプル: (start_pt, end_pt, role_name, icon_for_display)
-# Challenge含む
 # ----------------------------------------
 rank_roles = [
     (0, 2, "Beginner", "🔰"),
@@ -62,181 +48,327 @@ rank_roles = [
     (25, 9999, "Challenger", "😈"),
 ]
 
-# 内部ランク階層（rank1..rank6）
+# 内部ランク階層（rank1..rank6） : マッチ判定とpt増減ロジック簡略化用
 rank_ranges_internal = {
-    1: range(0, 5),
-    2: range(5, 10),
-    3: range(10, 15),
-    4: range(15, 20),
-    5: range(20, 25),
-    6: range(25, 10000),
+    1: range(0, 5),    # 0-4
+    2: range(5, 10),   # 5-9
+    3: range(10, 15),  # 10-14
+    4: range(15, 20),  # 15-19
+    5: range(20, 25),  # 20-24
+    6: range(25, 10000),# 25+
 }
 
 # ----------------------------------------
-# 内部ランク取得
+# ユーティリティ関数
 # ----------------------------------------
-def get_internal_rank(pt:int) -> int:
-    for rank, rng in rank_ranges_internal.items():
-        if pt in rng:
-            return rank
-    return 6
-
-# ----------------------------------------
-# Pt計算
-# ----------------------------------------
-def calculate_pt(current:int, opponent:int, result:str) -> int:
-    diff_rank = get_internal_rank(opponent) - get_internal_rank(current)
-    if result == "win":
-        if diff_rank == 0:
-            return current + 1
-        elif diff_rank == 1:
-            return current + 2
-        elif diff_rank == 2:
-            return current + 3
-        else:
-            return current + 1
-    elif result == "lose":
-        # 降格処理
-        if current in (3,4):
-            return 2
-        elif current in (8,9):
-            return 7
-        elif current in (13,14):
-            return 12
-        elif current in (18,19):
-            return 17
-        elif current in (23,24):
-            return 22
-        # ベースロジック
-        if diff_rank == 0:
-            return current - 1
-        elif diff_rank == -1:
-            return current - 2
-        elif diff_rank == -2:
-            return current - 3
-        else:
-            return current -1
-    return current
-
-# ----------------------------------------
-# メンバーディスプレイ更新（名前＆ロール）
-# ----------------------------------------
-async def update_member_display(member: discord.Member):
-    uid = member.id
-    pt = user_data.get(uid, {}).get("pt",0)
-    # 名前更新
-    for start,end,role_name,icon in rank_roles:
+def get_rank_info(pt:int):
+    for start, end, role, icon in rank_roles:
         if start <= pt <= end:
-            try:
-                await member.edit(nick=f"{member.name} {icon} {pt}pt")
-            except:
-                pass
-            # ロール付与削除
-            guild_roles = {r.name:r for r in member.guild.roles}
-            # 付与
-            if role_name in guild_roles:
-                if guild_roles[role_name] not in member.roles:
-                    await member.add_roles(guild_roles[role_name])
-            # 他ロール削除
-            for _,_,r_name,_ in rank_roles:
-                if r_name != role_name and r_name in guild_roles:
-                    if guild_roles[r_name] in member.roles:
-                        await member.remove_roles(guild_roles[r_name])
-            break
+            return start, end, role, icon
+    return 0, 0, "Unknown", ""
+
+def get_internal_rank(pt:int):
+    for rank, r in rank_ranges_internal.items():
+        if pt in r:
+            return rank
+    return 1
+
+def calculate_pt(pt_a:int, pt_b:int, result:str):
+    rank_a = get_internal_rank(pt_a)
+    rank_b = get_internal_rank(pt_b)
+    diff = rank_b - rank_a
+    delta = 0
+    if result == "win":
+        if diff == 0:
+            delta = 1
+        elif diff == 1:
+            delta = 2
+        elif diff == 2:
+            delta = 3
+        elif diff == -1:
+            delta = 1
+        elif diff == -2:
+            delta = 1
+    elif result == "lose":
+        if diff == 0:
+            delta = -1
+        elif diff == 1:
+            delta = -1
+        elif diff == 2:
+            delta = -1
+        elif diff == -1:
+            delta = -2
+        elif diff == -2:
+            delta = -3
+    new_pt = pt_a + delta
+    # 例外の降格
+    if pt_a in (3,4) and new_pt < 2:
+        new_pt = 2
+    elif pt_a in (8,9) and new_pt < 7:
+        new_pt = 7
+    elif pt_a in (13,14) and new_pt < 12:
+        new_pt = 12
+    elif pt_a in (18,19) and new_pt < 17:
+        new_pt = 17
+    elif pt_a in (23,24) and new_pt < 22:
+        new_pt = 22
+    return new_pt
 
 # ----------------------------------------
-# マッチング確認
+# Discord Bot
 # ----------------------------------------
-def is_registered_match(a:int, b:int) -> bool:
+intents = discord.Intents.default()
+intents.members = True
+bot = discord.Client(intents=intents)
+tree = app_commands.CommandTree(bot)
+
+# ----------------------------------------
+# ランキング関連
+# ----------------------------------------
+async def update_member_display(member:discord.Member):
+    pt = user_data.get(member.id, {}).get("pt", 0)
+    start, end, role_name, icon = get_rank_info(pt)
+    try:
+        await member.edit(nick=f"{member.display_name} {icon} {pt}pt")
+    except:
+        pass
+    # ロール更新
+    guild = member.guild
+    for start_r, end_r, role, _ in rank_roles:
+        role_obj = discord.utils.get(guild.roles, name=role)
+        if role_obj:
+            if start_r <= pt <= end_r:
+                if role_obj not in member.roles:
+                    await member.add_roles(role_obj)
+            else:
+                if role_obj in member.roles:
+                    await member.remove_roles(role_obj)
+
+def generate_ranking_text():
+    # pt順ソート
+    sorted_users = sorted(user_data.items(), key=lambda x: -x[1].get("pt",0))
+    ranking_lines = []
+    rank = 0
+    prev_pt = None
+    displayed_rank = 0
+    for i, (uid, data) in enumerate(sorted_users):
+        pt = data.get("pt",0)
+        start, end, role_name, icon = get_rank_info(pt)
+        if pt != prev_pt:
+            displayed_rank = i+1
+            prev_pt = pt
+        user_line = f"{displayed_rank}位 <@{uid}> {icon} {pt}pt"
+        ranking_lines.append(user_line)
+    return "\n".join(ranking_lines)
+
+async def post_ranking(channel_id:int):
+    guild = bot.get_guild(GUILD_ID)
+    if not guild:
+        return
+    ch = guild.get_channel(channel_id)
+    if not ch:
+        return
+    text = generate_ranking_text()
+    await ch.send(f"📊 ランキング\n{text}")
+
+# 自動投稿タスク
+@tasks.loop(minutes=1)
+async def auto_post_ranking_task():
+    now = datetime.utcnow() + timedelta(hours=9)
+    if now.hour == 14 and now.minute == 0:
+        await post_ranking(RANKING_CHANNEL_ID)
+    elif now.hour == 23 and now.minute == 0:
+        await post_ranking(RANKING_CHANNEL_ID)
+
+# ----------------------------------------
+# マッチ承認ビュー
+# ----------------------------------------
+class ApproveMatchView(discord.ui.View):
+    def __init__(self, applicant_id:int, opponent_id:int, origin_channel_id:int):
+        super().__init__(timeout=None)
+        self.applicant_id = applicant_id
+        self.opponent_id = opponent_id
+        self.origin_channel_id = origin_channel_id
+
+    @discord.ui.button(label="承認", style=discord.ButtonStyle.success)
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.opponent_id:
+            await interaction.response.send_message("承認できるのは申請された相手のみです。", ephemeral=True)
+            return
+        matching[self.applicant_id] = self.opponent_id
+        matching[self.opponent_id] = self.applicant_id
+        guild = interaction.guild
+        ch = guild.get_channel(self.origin_channel_id) if self.origin_channel_id else interaction.channel
+        if ch:
+            await ch.send(f"<@{self.applicant_id}> と <@{self.opponent_id}> のマッチングが成立しました。試合後、勝者が結果報告をしてください。")
+        await interaction.response.send_message("承認しました。", ephemeral=True)
+        self.stop()
+
+class CancelExistingMatchView(discord.ui.View):
+    def __init__(self, existing_a:int, existing_b:int):
+        super().__init__(timeout=60)
+        self.existing_a = existing_a
+        self.existing_b = existing_b
+
+    @discord.ui.button(label="取り消す", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        a = self.existing_a
+        b = self.existing_b
+        if matching.get(a) == b:
+            matching.pop(a, None)
+            matching.pop(b, None)
+            await interaction.response.send_message(f"<@{a}> と <@{b}> のマッチングは解除されました。", ephemeral=False)
+        else:
+            await interaction.response.send_message("該当のマッチは既に解除されています。", ephemeral=True)
+        self.stop()
+
+class ResultApproveView(discord.ui.View):
+    def __init__(self, winner_id:int, loser_id:int):
+        super().__init__(timeout=None)
+        self.winner_id = winner_id
+        self.loser_id = loser_id
+        self.processed = False
+
+    @discord.ui.button(label="承認", style=discord.ButtonStyle.success)
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.loser_id:
+            await interaction.response.send_message("これはあなたの試合ではないようです。", ephemeral=True)
+            return
+        if self.processed:
+            await interaction.response.send_message("既に処理済みです。", ephemeral=True)
+            return
+        self.processed = True
+        await interaction.response.edit_message(content="承認されました。結果を反映します。", view=None)
+        await handle_approved_result(self.winner_id, self.loser_id, interaction.channel)
+
+    @discord.ui.button(label="異議", style=discord.ButtonStyle.danger)
+    async def dispute(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.loser_id:
+            await interaction.response.send_message("これはあなたの試合ではないようです。", ephemeral=True)
+            return
+        if self.processed:
+            await interaction.response.send_message("既に処理済みです。", ephemeral=True)
+            return
+        self.processed = True
+        await interaction.response.edit_message(content="異議が申立てられました。審判チャンネルへ通知します。", view=None)
+        guild = interaction.guild
+        judge_ch = guild.get_channel(JUDGE_CHANNEL_ID)
+        if judge_ch:
+            await judge_ch.send(f"⚖️ 審議依頼: <@{self.winner_id}> vs <@{self.loser_id}> に異議が出ました。@<@{ADMIN_ID}> に連絡してください。")
+        matching.pop(self.winner_id, None)
+        matching.pop(self.loser_id, None)
+
+# ----------------------------------------
+# 勝者承認処理
+# ----------------------------------------
+async def handle_approved_result(winner_id:int, loser_id:int, channel: discord.abc.Messageable):
+    if not is_registered_match(winner_id, loser_id):
+        await channel.send("このマッチングは登録されていません。まずはマッチング申請をお願いします。")
+        return
+    winner_pt = user_data.get(winner_id, {}).get("pt", 0)
+    loser_pt  = user_data.get(loser_id, {}).get("pt", 0)
+    winner_new = calculate_pt(winner_pt, loser_pt, "win")
+    loser_new  = calculate_pt(loser_pt, winner_pt, "lose")
+    user_data.setdefault(winner_id, {})["pt"] = winner_new
+    user_data.setdefault(loser_id,  {})["pt"] = loser_new
+    for g in bot.guilds:
+        w_member = g.get_member(winner_id)
+        l_member = g.get_member(loser_id)
+        if w_member:
+            await update_member_display(w_member)
+        if l_member:
+            await update_member_display(l_member)
+    matching.pop(winner_id, None)
+    matching.pop(loser_id, None)
+    delta_w = winner_new - winner_pt
+    delta_l = loser_new - loser_pt
+    await channel.send(f"✅ <@{winner_id}> に +{delta_w}pt／<@{loser_id}> に {delta_l}pt の反映を行いました。")
+
+def is_registered_match(a:int, b:int):
     return matching.get(a) == b and matching.get(b) == a
 
 # ----------------------------------------
-# Views & 承認処理（省略せず最新版完全実装）
-# ※ ApproveMatchView, CancelExistingMatchView, ResultApproveView
-# ※ handle_approved_result も含む
+# コマンド: マッチ申請
 # ----------------------------------------
-# ... ここはあなたが既に完全版として確認済みのまま省略せず実装してください ...
+@tree.command(name="マッチ申請", description="対戦相手にマッチ申請を出します")
+@app_commands.describe(opponent="対戦相手")
+async def cmd_match_request(interaction: discord.Interaction, opponent: discord.Member):
+    applicant = interaction.user
+    applicant_pt = user_data.get(applicant.id, {}).get("pt", 0)
+    opponent_pt = user_data.get(opponent.id, {}).get("pt", 0)
+    # 自身と相手の内部rank差
+    rank_diff = abs(get_internal_rank(applicant_pt) - get_internal_rank(opponent_pt))
+    if rank_diff >= 3:
+        await interaction.response.send_message("申し訳ありません。ランク差が大きすぎてマッチングできません。", ephemeral=True)
+        return
+    # チャレンジ時制約
+    challenge_pts = (3,4,8,9,13,14,18,19,23,24)
+    if applicant_pt in challenge_pts or opponent_pt in challenge_pts:
+        if get_internal_rank(applicant_pt) != get_internal_rank(opponent_pt):
+            await interaction.response.send_message(f"{opponent.display_name} は昇級チャレンジ状態のため、この申請はできません。", ephemeral=True)
+            return
+    view = ApproveMatchView(applicant.id, opponent.id, interaction.channel.id if interaction.channel else None)
+    content = f"<@{opponent.id}> に {applicant.display_name} からマッチ申請が届きました。承認してください。"
+    ch = interaction.channel
+    await ch.send(content, view=view)
+    await interaction.response.send_message(f"{opponent.display_name} にマッチング申請しました。承認を待ってください。", ephemeral=True)
 
 # ----------------------------------------
-# コマンド: /admin_show_ranking（standard competition ranking対応）
+# コマンド: 結果報告
 # ----------------------------------------
-@bot.tree.command(name="admin_show_ranking", description="管理者用: ランキング表示（順位付き・同率対応）")
-async def cmd_admin_show_ranking(interaction: discord.Interaction):
+@tree.command(name="結果報告", description="（勝者用）対戦結果を報告します。敗者を指定してください。")
+@app_commands.describe(opponent="敗者のメンバー")
+async def cmd_report_result(interaction: discord.Interaction, opponent: discord.Member):
+    winner = interaction.user
+    loser = opponent
+    if not is_registered_match(winner.id, loser.id):
+        await interaction.response.send_message("このマッチングは登録されていません。まずはマッチング申請をお願いします。", ephemeral=True)
+        return
+    content = f"この試合の勝者は <@{winner.id}> です。結果に同意しますか？"
+    sent_msg = await interaction.channel.send(content, view=ResultApproveView(winner.id, loser.id))
+    await interaction.response.send_message("結果報告を受け付けました。敗者の承認を待ちます。", ephemeral=True)
+    async def auto_approve_task():
+        await asyncio.sleep(AUTO_APPROVE_SECONDS)
+        if is_registered_match(winner.id, loser.id):
+            await handle_approved_result(winner.id, loser.id, interaction.channel)
+    bot.loop.create_task(auto_approve_task())
+
+# ----------------------------------------
+# 管理者コマンド
+# ----------------------------------------
+@tree.command(name="admin_reset_all", description="全ユーザーのPTと表示を初期化")
+async def cmd_admin_reset_all(interaction: discord.Interaction):
     if interaction.user.id != ADMIN_ID:
-        await interaction.response.send_message("管理者専用です。", ephemeral=True)
+        await interaction.response.send_message("管理者専用コマンドです。", ephemeral=True)
         return
+    user_data.clear()
+    await interaction.response.send_message("全ユーザーのPTと表示を初期化しました。", ephemeral=True)
 
-    groups = defaultdict(list)
-    for uid, data in user_data.items():
-        groups[data.get("pt", 0)].append(uid)
-
-    if not groups:
-        await interaction.response.send_message("まだユーザーが登録されていません。", ephemeral=True)
+@tree.command(name="admin_set_pt", description="ユーザーのPTを設定します")
+@app_commands.describe(user="対象ユーザー", pt="設定するPT")
+async def cmd_admin_set_pt(interaction: discord.Interaction, user: discord.Member, pt: int):
+    if interaction.user.id != ADMIN_ID:
+        await interaction.response.send_message("管理者専用コマンドです。", ephemeral=True)
         return
-
-    pts_desc = sorted(groups.keys(), reverse=True)
-    lines = []
-    rank = 1
-    count_so_far = 0
-    for pt in pts_desc:
-        uids = groups[pt]
-        members = []
-        for uid in uids:
-            member = interaction.guild.get_member(uid)
-            name = member.name if member else f"Unknown({uid})"
-            members.append((name, uid))
-        members.sort(key=lambda x:x[0].lower())
-        current_rank = count_so_far + 1
-        for name, uid in members:
-            lines.append(f"{current_rank}. {name} - {pt}pt")
-        count_so_far += len(members)
-
-    await interaction.response.send_message("ランキングを投稿しました（管理者にのみ表示）", ephemeral=True)
-    ranking_text = "**ランキング**\n" + "\n".join(lines)
-    ch = bot.get_channel(RANKING_CHANNEL_ID)
-    if ch:
-        await ch.send(ranking_text)
+    user_data.setdefault(user.id, {})["pt"] = pt
+    await update_member_display(user)
+    await interaction.response.send_message(f"{user.display_name} のPTを {pt} に設定しました。", ephemeral=True)
 
 # ----------------------------------------
-# 自動投稿タスク（14:00 / 23:00 JST）
+# ランキング確認
 # ----------------------------------------
-@tasks.loop(minutes=1)
-async def auto_ranking_post():
-    now = datetime.now()
-    if now.time().hour == 14 or now.time().hour == 23:
-        guild = bot.get_guild(GUILD_ID)
-        ch = guild.get_channel(RANKING_CHANNEL_ID)
-        if ch:
-            # 標準同率順位ランキング作成
-            groups = defaultdict(list)
-            for uid,data in user_data.items():
-                groups[data.get("pt",0)].append(uid)
-            pts_desc = sorted(groups.keys(), reverse=True)
-            lines=[]
-            rank=1
-            count_so_far=0
-            for pt in pts_desc:
-                uids=groups[pt]
-                members=[]
-                for uid in uids:
-                    member = guild.get_member(uid)
-                    name = member.name if member else f"Unknown({uid})"
-                    members.append((name,uid))
-                members.sort(key=lambda x:x[0].lower())
-                current_rank = count_so_far +1
-                for name,_ in members:
-                    lines.append(f"{current_rank}. {name} - {pt}pt")
-                count_so_far+=len(members)
-            if lines:
-                await ch.send("**自動ランキング**\n" + "\n".join(lines))
+@tree.command(name="ランキング", description="現在のPTランキングを表示します")
+async def cmd_show_ranking(interaction: discord.Interaction):
+    text = generate_ranking_text()
+    await interaction.response.send_message(f"📊 ランキング\n{text}", ephemeral=False)
 
 # ----------------------------------------
-# Bot起動
+# Bot 起動
 # ----------------------------------------
 @bot.event
 async def on_ready():
     print(f"{bot.user} is ready.")
-    if not auto_ranking_post.is_running():
-        auto_ranking_post.start()
+    await tree.sync()
+    auto_post_ranking_task.start()
 
 bot.run(DISCORD_TOKEN)
