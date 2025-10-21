@@ -1,19 +1,20 @@
 import discord
-from discord.ext import commands, tasks
 from discord import app_commands
-import os
+from discord.ext import commands
+import asyncio
+
+TOKEN = "YOUR_BOT_TOKEN"
+ADMIN_ID = "YOUR_ADMIN_ID"  # 管理者ID
 
 intents = discord.Intents.default()
+intents.message_content = True
 intents.members = True
-bot = commands.Bot(command_prefix="/", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
+# ユーザーデータ
+user_data = {}  # {user_id: pt}
 
-# 内部データ
-user_data = {}  # {user_id: {"pt": int, "role": str, "rank": int}}
-active_matches = {}  # {(winner_id, loser_id): {"channel_id": int, "message_id": int}}
-
-# ランクとアイコン
+# ランク設定
 RANKS = [
     (0, 2, "Beginner", "🔰"),
     (3, 4, "SilverChallenge1", "🔰🔥"),
@@ -25,133 +26,127 @@ RANKS = [
     (18, 19, "GrandMasterChallenge1", "⚔️🔥"),
     (20, 22, "GrandMaster", "🪽"),
     (23, 24, "ChallengerChallenge1", "🪽🔥"),
-    (25, float("inf"), "Challenger", "😈")
+    (25, 999, "Challenger", "😈")
 ]
 
-# rank差計算用内部rank
-def get_internal_rank(pt):
-    if pt <= 4:
-        return 1
-    elif pt <= 9:
-        return 2
-    elif pt <= 14:
-        return 3
-    elif pt <= 19:
-        return 4
-    elif pt <= 24:
-        return 5
-    else:
-        return 6
-
-def get_rank_role(pt):
-    for min_pt, max_pt, role_name, icon in RANKS:
+def get_rank_by_pt(pt: int):
+    for min_pt, max_pt, name, icon in RANKS:
         if min_pt <= pt <= max_pt:
-            return role_name, icon
-    return "Challenger", "😈"
+            return name, icon
+    return "Unknown", ""
 
-def adjust_pt_after_loss(pt):
-    if pt in [3, 4]:
-        return 2
-    if pt in [8, 9]:
-        return 7
-    if pt in [13, 14]:
-        return 12
-    if pt in [18, 19]:
-        return 17
-    return pt
-
-# --- ユーザー名とロール同期 ---
-async def update_user_display(member: discord.Member):
-    data = user_data.get(member.id)
-    if not data:
-        return
-    role_name, icon = get_rank_role(data["pt"])
-    # ロール付与
-    role = discord.utils.get(member.guild.roles, name=role_name)
-    if role:
-        for r in member.roles:
-            if r.name in [rname for _, _, rname, _ in RANKS]:
-                await member.remove_roles(r)
-        await member.add_roles(role)
+async def update_member_role_and_name(member: discord.Member):
+    pt = user_data.get(member.id, 0)
+    rank_name, icon = get_rank_by_pt(pt)
     # ユーザー名更新
-    new_name = f"{member.name} {icon} {data['pt']}pt"
-    if member.display_name != new_name:
+    try:
+        base_name = member.name.split(" ")[0]
+        new_name = f"{base_name} {icon} {pt}pt"
+        await member.edit(nick=new_name)
+    except Exception as e:
+        print(f"Error updating name for {member}: {e}")
+    # ロール更新
+    await reset_user_role(member)
+
+async def reset_user_role(member: discord.Member):
+    for _, _, role_name, _ in RANKS:
+        role = discord.utils.get(member.guild.roles, name=role_name)
+        if role and role in member.roles:
+            try:
+                await member.remove_roles(role)
+            except Exception as e:
+                print(f"Error removing role {role_name} from {member}: {e}")
+    pt = user_data.get(member.id, 0)
+    rank_name, _ = get_rank_by_pt(pt)
+    role = discord.utils.get(member.guild.roles, name=rank_name)
+    if role:
         try:
-            await member.edit(nick=new_name)
-        except discord.Forbidden:
-            pass
+            await member.add_roles(role)
+        except Exception as e:
+            print(f"Error adding role {rank_name} to {member}: {e}")
 
-# --- 管理者コマンド ---
-@bot.tree.command(name="admin_reset_all")
+@bot.event
+async def on_ready():
+    await bot.tree.sync()
+    print(f"{bot.user} is ready and command tree synced.")
+
+# 管理者用: 全ユーザー初期化
+@bot.tree.command(name="admin_reset_all", description="全ユーザーのPT・ロール・名前を初期化")
 async def cmd_admin_reset_all(interaction: discord.Interaction):
-    if interaction.user.id != ADMIN_ID:
-        await interaction.response.send_message("管理者専用です。", ephemeral=True)
+    if str(interaction.user.id) != ADMIN_ID:
+        await interaction.response.send_message("管理者専用コマンドです。", ephemeral=True)
         return
-    for guild in bot.guilds:
-        for member in guild.members:
-            user_data[member.id] = {"pt": 0, "role": "Beginner"}
-            await update_user_display(member)
-    await interaction.response.send_message("全ユーザーのPTと表示を初期化しました。", ephemeral=True)
 
-@bot.tree.command(name="admin_set_pt")
-@app_commands.describe(user="ユーザー", pt="PT値")
+    if not interaction.response.is_done():
+        await interaction.response.send_message("全ユーザーの初期化を開始します...", ephemeral=True)
+
+    for member in interaction.guild.members:
+        if member.bot:
+            continue
+        user_data[member.id] = 0
+        await reset_user_role(member)
+        await update_member_role_and_name(member)
+
+    await interaction.followup.send("全ユーザーのPTと表示を初期化しました。")
+
+# 管理者用: PT設定
+@bot.tree.command(name="admin_set_pt", description="特定ユーザーのPTを設定")
+@app_commands.describe(user="対象ユーザー", pt="設定するPT")
 async def cmd_admin_set_pt(interaction: discord.Interaction, user: discord.Member, pt: int):
-    if interaction.user.id != ADMIN_ID:
-        await interaction.response.send_message("管理者専用です。", ephemeral=True)
+    if str(interaction.user.id) != ADMIN_ID:
+        await interaction.response.send_message("管理者専用コマンドです。", ephemeral=True)
         return
-    user_data[user.id] = {"pt": pt, "role": get_rank_role(pt)[0]}
-    await update_user_display(user)
-    await interaction.response.send_message(f"{user.name} のPTを {pt} に設定しました。", ephemeral=True)
 
-@bot.tree.command(name="admin_show_ranking")
+    user_data[user.id] = pt
+    await update_member_role_and_name(user)
+    if not interaction.response.is_done():
+        await interaction.response.send_message(f"{user.name} のPTを {pt} に設定しました。", ephemeral=True)
+    else:
+        await interaction.followup.send(f"{user.name} のPTを {pt} に設定しました。")
+
+# 管理者用: ランキング表示
+@bot.tree.command(name="admin_show_ranking", description="管理者用ランキング表示")
 async def cmd_admin_show_ranking(interaction: discord.Interaction):
-    if interaction.user.id != ADMIN_ID:
-        await interaction.response.send_message("管理者専用です。", ephemeral=True)
+    if str(interaction.user.id) != ADMIN_ID:
+        await interaction.response.send_message("管理者専用コマンドです。", ephemeral=True)
         return
-    ranking_list = []
-    for uid, data in sorted(user_data.items(), key=lambda x: -x[1]["pt"]):
-        member = interaction.guild.get_member(uid)
-        if member:
-            ranking_list.append(f"{member.name} {data['pt']}pt")
-    if not ranking_list:
-        ranking_list.append("ランキングはまだありません。")
-    await interaction.response.send_message("\n".join(ranking_list), ephemeral=True)
 
-# --- マッチ申請・承認 ---
+    ranking_list = []
+    for member_id, pt in sorted(user_data.items(), key=lambda x: -x[1]):
+        member = interaction.guild.get_member(member_id)
+        if member:
+            ranking_list.append(f"{member.name}")  # 純ユーザー名のみ
+
+    if ranking_list:
+        await interaction.response.send_message("\n".join(ranking_list), ephemeral=True)
+    else:
+        await interaction.response.send_message("ランキングデータが存在しません。", ephemeral=True)
+
+# マッチ申請
+@bot.tree.command(name="match_request", description="マッチ申請")
+@app_commands.describe(opponent="対戦相手")
+async def cmd_match_request(interaction: discord.Interaction, opponent: discord.Member):
+    await interaction.response.send_message(f"{interaction.user.mention} が {opponent.mention} にマッチ申請しました。", ephemeral=False)
+    view = ApproveMatchView(origin_channel_id=interaction.channel.id, requester=interaction.user)
+    try:
+        await opponent.send("あなたにマッチ申請が届きました。承認してください。", view=view)
+    except Exception as e:
+        await interaction.followup.send(f"相手にDMを送信できません: {e}", ephemeral=True)
+
+# 承認ボタンビュー
 class ApproveMatchView(discord.ui.View):
-    def __init__(self, opponent_id, origin_channel_id=None):
+    def __init__(self, origin_channel_id, requester):
         super().__init__(timeout=None)
-        self.opponent_id = opponent_id
         self.origin_channel_id = origin_channel_id
+        self.requester = requester
 
     @discord.ui.button(label="承認", style=discord.ButtonStyle.success)
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.opponent_id:
-            await interaction.response.send_message("これはあなたの試合ではありません。", ephemeral=True)
+        if interaction.user.id != self.requester.id:
+            await interaction.response.send_message("これはあなたの試合ではありません", ephemeral=True)
             return
-        # マッチ成立処理
-        await interaction.response.send_message("マッチングが承認されました。試合後、勝者が結果報告をしてください。", ephemeral=False)
+        await interaction.response.send_message(
+            f"{self.requester.mention} と {interaction.user.mention} のマッチングが成立しました。試合後、勝者が結果報告をしてください。"
+        )
 
-@bot.tree.command(name="match_request")
-@app_commands.describe(opponent="対戦相手")
-async def cmd_match_request(interaction: discord.Interaction, opponent: discord.Member):
-    if interaction.user.id == opponent.id:
-        await interaction.response.send_message("自分には申請できません。", ephemeral=True)
-        return
-    # 重複確認
-    for (w, l) in active_matches.keys():
-        if interaction.user.id in (w, l) or opponent.id in (w, l):
-            await interaction.response.send_message(f"{opponent.name} とのマッチはすでに存在します。取り消しますか？", ephemeral=False)
-            return
-    view = ApproveMatchView(opponent.id)
-    await interaction.response.send_message(
-        f"{interaction.user.mention} が {opponent.mention} にマッチ申請を送りました。",
-        view=view
-    )
-
-# --- イベント ---
-@bot.event
-async def on_ready():
-    print(f"{bot.user} is ready")
-
-bot.run(os.environ["DISCORD_TOKEN"])
+bot.run(TOKEN)
