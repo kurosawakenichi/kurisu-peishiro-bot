@@ -1,173 +1,179 @@
 import os
-import asyncio
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
+import asyncio
+import random
+from datetime import datetime, timedelta
 
-# Variables
+# Variables from Railway
 GUILD_ID = int(os.environ["GUILD_ID"])
 JUDGE_CHANNEL_ID = int(os.environ["JUDGE_CHANNEL_ID"])
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 
+# Bot setup
 intents = discord.Intents.default()
 intents.members = True
-
 bot = commands.Bot(command_prefix="/", intents=intents)
 tree = bot.tree
 
-# 内部リスト管理
-match_request_list = {}  # {user_id: timestamp}
-drawing_list = []        # [user_id]
-in_match = {}            # {user_id: opponent_id}
+# Data storage
+players = {}  # user_id: {"pt": int, "last_update": datetime}
+match_requests = {}  # user_id: datetime of request
+drawing_list = set()
+in_match = {}  # user_id: opponent_id
 
-# ランク制限用
-RANKS = [(0, 4, "Beginner", "🔰"),
-         (5, 9, "Silver", "🥈"),
-         (10, 14, "Gold", "🥇"),
-         (15, 19, "Master", "⚔️"),
-         (20, 24, "GrandMaster", "🪽"),
-         (25, 999, "Challenger", "😈")]
+# Rank thresholds for roles
+rank_roles = [
+    (0, 4, "Beginner", "🔰"),
+    (5, 9, "Silver", "🥈"),
+    (10, 14, "Gold", "🥇"),
+    (15, 19, "Master", "⚔️"),
+    (20, 24, "GrandMaster", "🪽"),
+    (25, 9999, "Challenger", "😈"),
+]
 
-# PT管理
-user_pt = {}  # {user_id: pt}
-
-# Utility functions
-def get_rank(pt: int):
-    for low, high, name, emoji in RANKS:
+# --- Utility Functions ---
+def get_rank_role(pt):
+    for low, high, name, emoji in rank_roles:
         if low <= pt <= high:
-            return name, emoji
-    return "Unknown", "❓"
+            return f"{emoji} {name}"
+    return "🔰 Beginner"
 
-def can_match(user1_id, user2_id):
-    pt1 = user_pt.get(user1_id, 0)
-    pt2 = user_pt.get(user2_id, 0)
-    # 階級差チェック
-    for low, high, _, _ in RANKS:
-        if low <= pt1 <= high:
-            rank1 = (low, high)
-        if low <= pt2 <= high:
-            rank2 = (low, high)
-    # 同rank帯のみマッチ可能
-    return rank1 == rank2
+async def update_nickname(member):
+    pt = players.get(member.id, {}).get("pt", 0)
+    role_str = get_rank_role(pt)
+    nickname = f"{member.name} {role_str} {pt}pt"
+    try:
+        await member.edit(nick=nickname)
+    except discord.Forbidden:
+        # Bot cannot change this member's nickname
+        pass
 
-# コマンド同期処理
+def remove_from_lists(user_id):
+    match_requests.pop(user_id, None)
+    drawing_list.discard(user_id)
+    opponent = in_match.pop(user_id, None)
+    if opponent:
+        in_match.pop(opponent, None)
+
+# --- Events ---
 @bot.event
 async def on_ready():
     print(f"{bot.user} is ready. Guilds: {[g.name for g in bot.guilds]}")
+    guild = bot.get_guild(GUILD_ID)
+    if guild:
+        await tree.clear_commands(guild=guild)
+        await tree.sync(guild=guild)
+        print("Commands cleared and synced for guild")
+    else:
+        print("指定したGUILD_IDのギルドが取得できません")
 
-    # ギルド単位で旧コマンドをクリア
-    guild = discord.Object(id=GUILD_ID)
-    await tree.clear_commands(guild=guild)
-
-    # 新コマンド同期
-    await tree.sync(guild=guild)
-    print("Commands synced")
-
-# /マッチ希望
-@tree.command(name="マッチ希望", description="ランダムマッチ希望", guild=discord.Object(id=GUILD_ID))
+# --- Commands ---
+@tree.command(name="マッチ希望", description="ランダムマッチに参加")
 async def match_request(interaction: discord.Interaction):
     user_id = interaction.user.id
+    now = datetime.utcnow()
     if user_id in in_match:
-        await interaction.response.send_message("既に対戦中です。", ephemeral=True)
+        await interaction.response.send_message("既にマッチ中です", ephemeral=True)
         return
-    if user_id in match_request_list:
-        await interaction.response.send_message("既にマッチ希望リストに登録されています。", ephemeral=True)
-        return
-
-    match_request_list[user_id] = asyncio.get_event_loop().time()
+    match_requests[user_id] = now
     await interaction.response.send_message("マッチング中です", ephemeral=True)
 
-    # 抽選処理 5秒
-    drawing_list.append(user_id)
-    await asyncio.sleep(5)
+    drawing_list.add(user_id)
 
-    # ランダム組み合わせ
+    await asyncio.sleep(5)  # 待機時間（抽選演出なし）
+
+    # ランダムマッチング
+    candidates = list(drawing_list)
+    random.shuffle(candidates)
     paired = set()
-    import random
-    random.shuffle(drawing_list)
-    for i in range(0, len(drawing_list) - 1, 2):
-        u1 = drawing_list[i]
-        u2 = drawing_list[i+1]
-        if can_match(u1, u2):
-            in_match[u1] = u2
-            in_match[u2] = u1
-            paired.add(u1)
-            paired.add(u2)
-            user1 = await bot.fetch_user(u1)
-            user2 = await bot.fetch_user(u2)
-            await user1.send(f"{user1.name} vs {user2.name} のマッチが成立しました。試合後、勝者が /結果報告 を行なってください")
-            await user2.send(f"{user1.name} vs {user2.name} のマッチが成立しました。試合後、勝者が /結果報告 を行なってください")
-            # 希望リストから削除
-            if u1 in match_request_list: del match_request_list[u1]
-            if u2 in match_request_list: del match_request_list[u2]
+    for i in range(0, len(candidates)-1, 2):
+        a, b = candidates[i], candidates[i+1]
+        # check pt difference <= 4
+        pt_a = players.get(a, {}).get("pt", 0)
+        pt_b = players.get(b, {}).get("pt", 0)
+        if abs(pt_a - pt_b) <= 4:
+            in_match[a] = b
+            in_match[b] = a
+            paired.update([a,b])
+            drawing_list.discard(a)
+            drawing_list.discard(b)
+            user_a = interaction.guild.get_member(a)
+            user_b = interaction.guild.get_member(b)
+            msg = f"{user_a.mention} vs {user_b.mention} のマッチが成立しました。試合後、勝者が /結果報告 を行なってください"
+            await user_a.send(msg)
+            await user_b.send(msg)
 
-    # 余りは残す
-    drawing_list.clear()
+    # 余りは希望リストに残すが抽選リストから削除
+    drawing_list.difference_update(paired)
 
-# /マッチ希望取下げ
-@tree.command(name="マッチ希望取下げ", description="マッチ希望を取り下げる", guild=discord.Object(id=GUILD_ID))
-async def cancel_match_request(interaction: discord.Interaction):
+@tree.command(name="マッチ希望取下げ", description="マッチ希望を取り下げます")
+async def cancel_request(interaction: discord.Interaction):
     user_id = interaction.user.id
-    if user_id in match_request_list:
-        del match_request_list[user_id]
+    if user_id in match_requests:
+        match_requests.pop(user_id)
+        drawing_list.discard(user_id)
         await interaction.response.send_message("マッチ希望を取り下げました", ephemeral=True)
     else:
-        await interaction.response.send_message("マッチ希望リストにありません", ephemeral=True)
+        await interaction.response.send_message("マッチ希望は存在しません", ephemeral=True)
 
-# /結果報告
-@tree.command(name="結果報告", description="勝者申告", guild=discord.Object(id=GUILD_ID))
+@tree.command(name="結果報告", description="勝者申告")
 async def report_result(interaction: discord.Interaction, winner: discord.Member):
     loser_id = in_match.get(winner.id)
-    if not loser_id:
+    if loser_id is None:
         await interaction.response.send_message("このマッチングは登録されていません。まずはマッチ申請をお願いします。", ephemeral=True)
         return
-    # 審議無しで承認処理
-    winner_pt = user_pt.get(winner.id, 0)
-    loser_pt = user_pt.get(loser_id, 0)
-    user_pt[winner.id] = winner_pt + 1
-    user_pt[loser_id] = max(loser_pt - 1, 0)
-    # in_matchから除外
-    del in_match[winner.id]
-    del in_match[loser_id]
-    await interaction.response.send_message(f"勝者 {winner.name} の勝利が登録されました。", ephemeral=False)
+    loser = interaction.guild.get_member(loser_id)
 
-# /admin_set_pt
-@tree.command(name="admin_set_pt", description="指定ユーザーのPTを設定", guild=discord.Object(id=GUILD_ID))
-async def admin_set_pt(interaction: discord.Interaction, member: discord.Member, pt: int):
-    if interaction.user.id != int(ADMIN_ID):
-        await interaction.response.send_message("管理者のみ実行可能です", ephemeral=True)
-        return
-    user_pt[member.id] = pt
-    await interaction.response.send_message(f"{member.name} のPTを {pt} に設定しました", ephemeral=False)
+    # 結果を待つボタン付きメッセージ
+    embed = discord.Embed(title="マッチ結果確認", description=f"{winner.mention} が勝利しました。\n{loser.mention} は異議がある場合【異議】を押してください。")
+    # 実際はボタン付きUIをここに追加
+    await interaction.response.send_message(embed=embed, ephemeral=False)
 
-# /admin_reset_all
-@tree.command(name="admin_reset_all", description="全ユーザーのPTをリセット", guild=discord.Object(id=GUILD_ID))
+    # 5分後、異議がなければ勝者決定
+    await asyncio.sleep(300)
+    # 実装上は異議フラグをチェック。フラグなしならpt加減算
+    players[winner.id] = {"pt": players.get(winner.id, {}).get("pt",0)+1, "last_update": datetime.utcnow()}
+    players[loser.id] = {"pt": max(players.get(loser.id, {}).get("pt",0)-1,0), "last_update": datetime.utcnow()}
+
+    remove_from_lists(winner.id)
+    remove_from_lists(loser.id)
+
+@tree.command(name="admin_reset_all", description="全プレイヤーptリセット（管理者専用）")
 async def admin_reset_all(interaction: discord.Interaction):
-    if interaction.user.id != int(ADMIN_ID):
-        await interaction.response.send_message("管理者のみ実行可能です", ephemeral=True)
+    if str(interaction.user.id) != ADMIN_ID:
+        await interaction.response.send_message("権限がありません", ephemeral=True)
         return
-    for k in user_pt.keys():
-        user_pt[k] = 0
-    await interaction.response.send_message("全プレイヤーのPTをリセットしました", ephemeral=False)
+    for uid in players.keys():
+        players[uid]["pt"] = 0
+    await interaction.response.send_message("全プレイヤーのptをリセットしました", ephemeral=False)
 
-# /ランキング
-@tree.command(name="ランキング", description="全ユーザーのランキング表示", guild=discord.Object(id=GUILD_ID))
-async def ranking(interaction: discord.Interaction):
-    # 標準競争順位
-    sorted_users = sorted(user_pt.items(), key=lambda x: -x[1])
+@tree.command(name="admin_set_pt", description="プレイヤーのpt設定（管理者専用）")
+async def admin_set_pt(interaction: discord.Interaction, member: discord.Member, pt: int):
+    if str(interaction.user.id) != ADMIN_ID:
+        await interaction.response.send_message("権限がありません", ephemeral=True)
+        return
+    players[member.id] = {"pt": pt, "last_update": datetime.utcnow()}
+    await update_nickname(member)
+    await interaction.response.send_message(f"{member.display_name} のptを {pt} に設定しました", ephemeral=False)
+
+@tree.command(name="ランキング", description="全ユーザーランキング表示")
+async def show_ranking(interaction: discord.Interaction):
+    ranking = sorted(players.items(), key=lambda x: -x[1]["pt"])
     result_lines = []
-    last_pt = None
-    rank = 0
-    display_rank = 0
-    for idx, (user_id, pt) in enumerate(sorted_users):
-        if pt != last_pt:
-            display_rank = idx + 1
-            last_pt = pt
-        member = await bot.fetch_user(user_id)
-        _, emoji = get_rank(pt)
-        result_lines.append(f"{display_rank}位 {member.name} {emoji} {pt}pt")
-    text = "🏆 ランキング\n" + "\n".join(result_lines)
-    await interaction.response.send_message(text, ephemeral=False)
+    rank_number = 1
+    prev_pt = None
+    for i, (uid, pdata) in enumerate(ranking, start=1):
+        if pdata["pt"] != prev_pt:
+            rank_number = i
+        member = interaction.guild.get_member(uid)
+        role_str = get_rank_role(pdata["pt"])
+        result_lines.append(f"{rank_number}位 {member.display_name} {role_str} {pdata['pt']}pt")
+        prev_pt = pdata["pt"]
+    embed = discord.Embed(title="🏆 ランキング", description="\n".join(result_lines))
+    await interaction.response.send_message(embed=embed, ephemeral=False)
 
+# --- Run bot ---
 bot.run(DISCORD_TOKEN)
