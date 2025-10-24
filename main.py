@@ -1,39 +1,29 @@
-# refresh_commands.py
 import os
-import asyncio
 import discord
 from discord import app_commands
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = int(os.environ["GUILD_ID"])
 
-class RefreshClient(discord.Client):
-    def __init__(self):
-        intents = discord.Intents.default()
-        super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
+intents = discord.Intents.default()
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
 
-    async def on_ready(self):
-        print(f"{self.user} is ready. Guild ID: {GUILD_ID}")
+@client.event
+async def on_ready():
+    print(f"{client.user} is ready. Guild ID: {GUILD_ID}")
+    
+    # ギルド同期だけ
+    guild = discord.Object(id=GUILD_ID)
+    await tree.sync(guild=guild)
+    print("コマンドをギルドに同期しました")
 
-        guild = discord.Object(id=GUILD_ID)
+# ここから下は【基本 main.py ランダム】のコマンド定義やロジックをそのまま書く
+# 例:
+/*
+@tree.command(name="マッチ希望", description="ランダムマッチ希望")
+async def match_request(interaction: discord.Interaction):
+    ...
+*/
 
-        # ギルド単位で旧コマンドを削除
-        try:
-            await self.tree.clear_commands(guild=guild)
-            print("旧コマンドをクリアしました")
-        except Exception as e:
-            print("clear_commands エラー:", e)
-
-        # ギルドに新しいコマンドを同期
-        try:
-            await self.tree.sync(guild=guild)
-            print("新しいコマンドをギルドに同期しました")
-        except Exception as e:
-            print("sync エラー:", e)
-
-        # 終了
-        await self.close()
-
-client = RefreshClient()
-asyncio.run(client.start(TOKEN))
+client.run(TOKEN)
