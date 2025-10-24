@@ -1,28 +1,49 @@
+# ================================
+# Discord Slash Command FULL DELETE
+# ================================
 import os
-import discord
-from discord import app_commands
+import aiohttp
+import asyncio
 
-TOKEN = os.environ["DISCORD_TOKEN"]
-GUILD_ID = int(os.environ["GUILD_ID"])
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")  # Railway / Render 等の環境変数そのまま利用
+GUILD_ID = 1427541907009044502  # ユーザーGuild
 
-class ClearCommandsClient(discord.Client):
-    def __init__(self):
-        intents = discord.Intents.default()
-        super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
+API_BASE = "https://discord.com/api/v10"
 
-    async def setup_hook(self):
-        guild = discord.Object(id=GUILD_ID)
-        # ①ローカルツリーから全部削除
-        self.tree._guild_commands[guild.id] = []  # ← 強制的に空にする
-        # ②そのまま同期（＝サーバーからも全部消える）
-        await self.tree.sync(guild=guild)
 
-    async def on_ready(self):
-        print(f"{self.user} is ready. Guild ID: {GUILD_ID}")
-        print("ギルドコマンドを全て削除しました。")
-        await self.close()
+async def delete_all_guild_commands():
+    headers = {
+        "Authorization": f"Bot {TOKEN}"
+    }
 
-if __name__ == "__main__":
-    client = ClearCommandsClient()
-    client.run(TOKEN)
+    # BotアプリIDを取得
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f"{API_BASE}/users/@me", headers=headers) as r:
+            data = await r.json()
+            app_id = data["id"]
+
+        # ギルドコマンド一覧取得
+        async with session.get(
+            f"{API_BASE}/applications/{app_id}/guilds/{GUILD_ID}/commands",
+            headers=headers
+        ) as r:
+            cmds = await r.json()
+
+        print(f"【削除対象コマンド数】{len(cmds)} 件")
+
+        # 削除処理
+        for cmd in cmds:
+            cmd_id = cmd["id"]
+            async with session.delete(
+                f"{API_BASE}/applications/{app_id}/guilds/{GUILD_ID}/commands/{cmd_id}",
+                headers=headers
+            ):
+                print(f" → 削除: {cmd['name']}")
+
+        print("✅ ギルド内コマンド 完全削除完了")
+
+
+async def main():
+    await delete_all_guild_commands()
+
+asyncio.run(main())
