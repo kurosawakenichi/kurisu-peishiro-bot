@@ -51,14 +51,19 @@ async def update_nickname(member: discord.Member, pt: int):
         role_emoji = get_role_emoji(pt)
         await member.edit(nick=f"{member.name} {role_emoji} {pt}pt")
     except discord.Forbidden:
-        # 管理者権限のないユーザーは変更不可
         pass
 
 @bot.event
 async def on_ready():
     print(f"{bot.user} is ready. Guilds: {[g.name for g in bot.guilds]}")
     guild = discord.Object(id=GUILD_ID)
+
+    # ギルド単位で旧コマンドクリア
+    await tree.clear_commands(guild=guild)
+
+    # 新コマンド同期
     await tree.sync(guild=guild)
+    print("Commands synced")
 
 # ---------- /マッチ希望 ----------
 @tree.command(name="マッチ希望", description="ランダムマッチ希望を出します")
@@ -71,7 +76,6 @@ async def match_request(interaction: discord.Interaction):
         match_waiting[user_id] = now + timedelta(minutes=5)
         await interaction.response.send_message("マッチング中です...", ephemeral=True)
 
-        # 抽選処理
         draw_list.append(user_id)
         await asyncio.sleep(5)
 
@@ -80,11 +84,10 @@ async def match_request(interaction: discord.Interaction):
         paired = []
         while len(available) >= 2:
             p1 = available.pop()
-            # 階級差制限チェック
             p1_pt = get_player_data(p1)["pt"]
             for i, p2 in enumerate(available):
                 p2_pt = get_player_data(p2)["pt"]
-                if abs(p1_pt - p2_pt) <= 2:  # 階級差制限
+                if abs(p1_pt - p2_pt) <= 2:
                     paired.append((p1, p2))
                     available.pop(i)
                     break
@@ -101,8 +104,6 @@ async def match_request(interaction: discord.Interaction):
             user2 = await bot.fetch_user(p2)
             await user1.send(f"{user1.name} vs {user2.name} のマッチが成立しました。試合後、勝者が /結果報告 を行なってください")
             await user2.send(f"{user1.name} vs {user2.name} のマッチが成立しました。試合後、勝者が /結果報告 を行なってください")
-
-        # 余りユーザーは5分間マッチ希望リストに残す
 
 # ---------- /マッチ希望取下げ ----------
 @tree.command(name="マッチ希望取下げ", description="マッチ希望を取り下げます")
@@ -134,10 +135,6 @@ async def report_result(interaction: discord.Interaction, winner: discord.Member
     else:
         await interaction.response.send_message("このマッチングは登録されていません。まずはマッチ申請をお願いします。", ephemeral=True)
         return
-
-    # 審議チャンネルへの通知などの処理
-    # 承認／異議ボタンの有効期限5分は内部で管理
-    # 異議発生時は in_match から除外、pendingは不要
 
 # ---------- 管理者コマンド ----------
 @tree.command(name="admin_reset_all", description="全プレイヤーのptをリセット")
