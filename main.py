@@ -2,274 +2,382 @@
 import os
 import asyncio
 import random
+import logging
 from datetime import datetime, timedelta
 
 import discord
-from discord.ext import commands, tasks
 from discord import app_commands
+from discord.ext import tasks
 
-# -----------------------
-# Configuration / Env
-# -----------------------
-DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
+# ---------- ログ ----------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("matchbot")
+
+# ---------- 環境変数 ----------
+TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = int(os.environ["GUILD_ID"])
 ADMIN_ID = int(os.environ["ADMIN_ID"])
-JUDGE_CHANNEL_ID = int(os.environ["JUDGE_CHANNEL_ID"])
+# optional channels
+RANKING_CHANNEL_ID = int(os.environ.get("RANKING_CHANNEL_ID") or 0)
+JUDGE_CHANNEL_ID = int(os.environ.get("JUDGE_CHANNEL_ID") or 0)
 
-# Timing constants
-HOPE_TTL_SECONDS = 5 * 60        # /マッチ希望 の期限（5分）
-DRAW_WAIT_SECONDS = 5            # 抽選待機時間（最後の参加からの秒数、ユーザー指定と同意）
-RESULT_APPROVE_SECONDS = 15 * 60 # 敗者承認待ち（15分 -> 自動承認）
+# 自動承認タイム（敗者承認待ちの時間）
+AUTO_APPROVE_SECONDS = 15 * 60  # 15分
 
-# -----------------------
-# Rank definitions
-# -----------------------
-# 表示用（絵文字含む）
-rank_roles = [
+# /マッチ希望 の保持時間
+MATCH_WISH_TTL = 5 * 60  # 5分
+
+# 抽選待機（短時間）: 5秒 に設定（仕様に合わせて）
+DRAW_WAIT_SECONDS = 5
+
+# 勝者申告後の敗者承認ボタンの有効期限（5分）
+RESULT_APPROVE_TIMEOUT = 5 * 60
+
+# ---------- Bot セットアップ ----------
+intents = discord.Intents.default()
+intents.members = True  # ユーザ情報が必要（ロール付与・ニック変更）
+intents.message_content = False  # 不要
+bot = discord.Client(intents=intents)
+tree = app_commands.CommandTree(bot)
+
+# ---------- データ構造（メモリ内） ----------
+# user_data: user_id -> {"pt": int}
+user_data: dict[int, dict] = {}
+
+# matching: user_id -> opponent_id  (for established matches)
+matching: dict[int, int] = {}
+
+# pending_applications: applicant_id -> (opponent_id, origin_channel_id, msg_id)
+# For direct match requests (not random); kept for compatibility (but Random variant uses /マッチ希望)
+pending_applications: dict[int, dict] = {}
+
+# hope_list: user_id -> timestamp (when they issued /マッチ希望)
+hope_list: dict[int, float] = {}
+
+# For tracking per-user TTL removal tasks (so we can cancel when user withdraws)
+hope_timers: dict[int, asyncio.Task] = {}
+
+# draw_in_progress flag and draw lock to prevent concurrent draws
+draw_lock = asyncio.Lock()
+draw_task: asyncio.Task | None = None
+
+# result_pending: (winner_id, loser_id) -> {"message": msg, "task": auto_approve_task}
+result_pending: dict[tuple[int, int], dict] = {}
+
+# role mapping (for display icon and role name)
+# Note: Random variant uses simplified rank (no challenge). Icons used for nickname formatting.
+rank_definitions = [
     (0, 4, "Beginner", "🔰"),
     (5, 9, "Silver", "🥈"),
     (10, 14, "Gold", "🥇"),
     (15, 19, "Master", "⚔️"),
-    (20, 24, "GrandMaster", "🪽"),
+    (20, 24, "GroundMaster", "🪽"),
     (25, 99999, "Challenger", "😈"),
 ]
 
-# 内部ランク（rank1..rank6） : マッチ判定とpt増減ロジック簡略化用
-internal_rank_map = {
+# internal rank ranges for rank-difference logic
+internal_rank_ranges = {
     1: range(0, 5),    # 0-4
     2: range(5, 10),   # 5-9
     3: range(10, 15),  # 10-14
     4: range(15, 20),  # 15-19
     5: range(20, 25),  # 20-24
-    6: range(25, 100000),
+    6: range(25, 10000), # 25+
 }
 
-def get_display_role(pt: int):
-    for low, high, name, emoji in rank_roles:
-        if low <= pt <= high:
-            return name, emoji
+# ---------- ユーティリティ関数 ----------
+
+def get_user_pt(user_id: int) -> int:
+    return user_data.get(user_id, {}).get("pt", 0)
+
+def set_user_pt(user_id: int, pt: int):
+    if pt < 0:
+        pt = 0
+    user_data.setdefault(user_id, {})["pt"] = pt
+
+def get_rank_info_by_pt(pt: int):
+    for start, end, role_name, icon in rank_definitions:
+        if isinstance(start, int) and isinstance(end, int):
+            if pt >= start and pt <= end:
+                return role_name, icon
+    # fallback
     return "Beginner", "🔰"
 
+def get_role_for_pt(guild: discord.Guild, pt: int):
+    role_name, _ = get_rank_info_by_pt(pt)
+    return discord.utils.get(guild.roles, name=role_name)
+
+def get_icon_for_pt(pt: int) -> str:
+    _, icon = get_rank_info_by_pt(pt)
+    return icon
+
 def get_internal_rank(pt: int) -> int:
-    for k, r in internal_rank_map.items():
-        if pt in r:
-            return k
+    for r, rng in internal_rank_ranges.items():
+        if pt in rng:
+            return r
     return 1
 
-# -----------------------
-# Bot setup
-# -----------------------
-intents = discord.Intents.default()
-intents.members = True
-intents.message_content = False
+# PT計算（ランク差による計算を internal_rank 差で扱う）
+def calculate_pt_change(winner_pt: int, loser_pt: int):
+    # internal ranks
+    wr = get_internal_rank(winner_pt)
+    lr = get_internal_rank(loser_pt)
+    diff = lr - wr  # positive if loser is higher internal rank than winner
+    # But we need to compute by perspective of winner vs loser
+    # Use the rules:
+    # same rank: winner +1, loser -1
+    # 1 rank up opponent: winner +2, loser -1
+    # 2 rank up opponent: winner +3, loser -1
+    # 1 rank down opponent: winner +1, loser -2
+    # 2 rank down opponent: winner +1, loser -3
+    rank_diff = get_internal_rank(loser_pt) - get_internal_rank(winner_pt)
+    # if loser is higher internal rank than winner: rank_diff > 0
+    if rank_diff == 0:
+        w_delta = 1
+        l_delta = -1
+    elif rank_diff == 1:
+        w_delta = 2
+        l_delta = -1
+    elif rank_diff == 2:
+        w_delta = 3
+        l_delta = -1
+    elif rank_diff == -1:
+        w_delta = 1
+        l_delta = -2
+    elif rank_diff == -2:
+        w_delta = 1
+        l_delta = -3
+    else:
+        # rank diff >=3 or <= -3 shouldn't have been allowed to match
+        w_delta = 1
+        l_delta = -1
+    return w_delta, l_delta
 
-bot = commands.Bot(command_prefix="/", intents=intents)
-tree = bot.tree
+def apply_rank_edge_cases_after_loss(pt_before: int) -> int:
+    # handle downgrade when the lost pt is in special ranges (3,4 -> 2 etc)
+    # per spec exceptions (for Random variant we kept same exceptions as main):
+    if pt_before in (3,4):
+        return 2
+    if pt_before in (8,9):
+        return 7
+    if pt_before in (13,14):
+        return 12
+    if pt_before in (18,19):
+        return 17
+    if pt_before in (23,24):
+        return 22
+    # else return current pt (they will be adjusted by deltas)
+    return None
 
-# -----------------------
-# In-memory storage
-# -----------------------
-# players: user_id -> {"pt": int, "updated": datetime}
-players = {}
+# nickname formatting: original_name (if possible) + " {icon} {pt}pt"
+def compose_display_nick(base_name: str, icon: str, pt: int):
+    return f"{base_name} {icon} {pt}pt"
 
-# match queues and state:
-# hope_list: user_id -> timestamp (when they issued /マッチ希望)
-hope_list = {}        # participants who have active hope (for 5min)
-# drawing set: users currently in the pending draw pool
-drawing_pool = set()
-# in_match: user_id -> opponent_id (both directions)
-in_match = {}
-
-# draw task controller
-_draw_task = None
-_draw_task_lock = asyncio.Lock()
-
-# pending result approvals: tuple (winner_id, loser_id) -> { "message": Message, "expires_at": datetime, "task": task }
-pending_results = {}
-
-# -----------------------
-# Helper functions
-# -----------------------
-def now_utc():
-    return datetime.utcnow()
-
-def clean_expired_hopes():
-    """ Remove expired hope_list entries older than HOPE_TTL_SECONDS """
-    cutoff = now_utc() - timedelta(seconds=HOPE_TTL_SECONDS)
-    expired = [uid for uid, ts in hope_list.items() if ts < cutoff]
-    for uid in expired:
-        hope_list.pop(uid, None)
-        drawing_pool.discard(uid)
-
-def standard_competition_ranking():
-    """Return list of (rank_number, user_id, pt) using standard competition ranking."""
-    # ensure players with no pt are included if they exist in guild
-    items = sorted(players.items(), key=lambda kv: (-kv[1].get("pt", 0), kv[0]))
-    result = []
-    last_pt = None
-    last_rank = 0
-    for i, (uid, pdata) in enumerate(items, start=1):
-        pt = pdata.get("pt", 0)
-        if pt != last_pt:
-            rank_number = i
-            last_pt = pt
-            last_rank = rank_number
-        else:
-            rank_number = last_rank
-        result.append((rank_number, uid, pt))
-    return result
+async def safe_update_nick(member: discord.Member, new_nick: str):
+    try:
+        # If the bot can't change nick (e.g., target is owner/higher role), ignore gracefully
+        await member.edit(nick=new_nick)
+    except Exception as e:
+        logger.debug(f"Failed to update nick for {member}: {e}")
 
 async def update_member_display(guild: discord.Guild, user_id: int):
-    """Update nickname/roles display for a single member based on players[user_id]['pt']"""
-    try:
-        member = guild.get_member(user_id)
-        if not member:
-            return
-        pt = players.get(user_id, {}).get("pt", 0)
-        name, emoji = get_display_role(pt)
-        # Desired nickname format: "表示名 {emoji} {pt}pt"
-        # If bot lacks permissions will silently fail.
-        new_nick = f"{member.name} {emoji} {pt}pt"
+    member = guild.get_member(user_id)
+    if not member:
+        return
+    pt = get_user_pt(user_id)
+    icon = get_icon_for_pt(pt)
+    # prefer original username without previous appended tag: strip trailing " {icon} {pt}pt" patterns
+    base = member.name
+    # If member.nick exists and includes pattern, remove it
+    name_to_use = member.name
+    # Compose new nick
+    new_nick = compose_display_nick(name_to_use, icon, pt)
+    # Limit nick length to 32
+    if len(new_nick) > 32:
+        new_nick = new_nick[:32]
+    await safe_update_nick(member, new_nick)
+    # Update roles: remove other rank roles, add correct one
+    role_for_pt = get_role_for_pt(guild, pt)
+    if role_for_pt:
         try:
-            await member.edit(nick=new_nick)
-        except discord.Forbidden:
-            # cannot change nickname: ignore silently
-            pass
-    except Exception:
-        pass
+            # Remove all rank roles then add the correct one
+            rank_role_names = [r[2] for r in rank_definitions]
+            to_remove = [r for r in guild.roles if r.name in rank_role_names and r in member.roles and r != role_for_pt]
+            if to_remove:
+                await member.remove_roles(*to_remove, reason="Rank sync")
+            if role_for_pt not in member.roles:
+                await member.add_roles(role_for_pt, reason="Rank sync")
+        except Exception as e:
+            logger.debug(f"Failed to update roles for {member}: {e}")
 
-def can_pair(a_pt:int, b_pt:int) -> bool:
-    """Check internal rank difference limit (<3)"""
-    ra = get_internal_rank(a_pt)
-    rb = get_internal_rank(b_pt)
-    return abs(ra - rb) < 3
+# ---------- マッチ/抽選ロジック ----------
 
-def schedule_draw(delay_seconds: int = DRAW_WAIT_SECONDS):
-    """Ensure a draw task is scheduled / restarted for DRAW_WAIT_SECONDS from now."""
-    global _draw_task
-    async def run_draw_after_wait():
-        await asyncio.sleep(delay_seconds)
-        # perform draw
-        await perform_draw()
-    # cancel previous and restart
-    if _draw_task and not _draw_task.done():
-        _draw_task.cancel()
-    _draw_task = asyncio.create_task(run_draw_after_wait())
-
-async def perform_draw():
-    """Perform random matching among drawing_pool, respecting can_pair constraints.
-    - Paired players are removed from hope_list and drawing_pool; in_match gets set.
-    - Unpaired remain in hope_list but removed from drawing_pool.
-    - Notify channel: public message in the channel where request was made is not recorded per-user;
-      We'll send a public message to the guild general (we use the first available channel: command used channel is preferable).
+async def start_draw_if_needed(guild: discord.Guild, origin_channel: discord.abc.Messageable):
     """
-    # We will pair randomly among drawing_pool
-    global drawing_pool
-    if not drawing_pool:
-        return
+    Called when hope_list changes. If enough participants exist and no draw in progress,
+    start a draw that waits DRAW_WAIT_SECONDS then attempts to randomly pair entries respecting rank constraints.
+    """
+    global draw_task
+    async with draw_lock:
+        if draw_task and not draw_task.done():
+            return  # already drawing
+        # if fewer than 2 participants, nothing to do
+        alive = list(hope_list.keys())
+        if len(alive) < 2:
+            return
+        # launch draw task
+        draw_task = asyncio.create_task(draw_and_pair(guild, origin_channel))
 
-    # snapshot and randomize
-    candidates = list(drawing_pool)
-    random.shuffle(candidates)
-    paired = []
-    unpaired = set()
-
-    # Attempt greedy pairings from randomized list
-    used = set()
-    for i in range(len(candidates)):
-        if candidates[i] in used:
+async def draw_and_pair(guild: discord.Guild, origin_channel: discord.abc.Messageable):
+    """
+    Wait DRAW_WAIT_SECONDS allowing more joiners, then attempt to pair randomly.
+    Respect rank-difference constraint: internal rank difference must be < 3.
+    Matched pairs are removed from hope_list and added to matching.
+    Matched users are notified publicly in the channel where their /マッチ希望 was issued (origin_channel).
+    """
+    await asyncio.sleep(DRAW_WAIT_SECONDS)
+    # snapshot of current hope_list keys (note: hope_list entries may change concurrently)
+    participants = list(hope_list.keys())
+    random.shuffle(participants)
+    paired = set()
+    pairs = []
+    # greedy: try to pair in random order with first compatible partner
+    for i, a in enumerate(participants):
+        if a in paired:
             continue
-        a = candidates[i]
-        paired_flag = False
-        for j in range(i+1, len(candidates)):
-            b = candidates[j]
-            if b in used:
+        for b in participants[i+1:]:
+            if b in paired:
                 continue
-            a_pt = players.get(a, {}).get("pt", 0)
-            b_pt = players.get(b, {}).get("pt", 0)
-            if can_pair(a_pt, b_pt):
-                # pair them
-                in_match[a] = b
-                in_match[b] = a
-                used.add(a)
-                used.add(b)
-                paired.append((a,b))
-                paired_flag = True
-                break
-        if not paired_flag and a not in used:
-            unpaired.add(a)
-
-    # Remove paired from hope_list and drawing_pool
-    for a,b in paired:
+            # check internal rank diff
+            ar = get_internal_rank(get_user_pt(a))
+            br = get_internal_rank(get_user_pt(b))
+            if abs(ar - br) >= 3:
+                continue
+            # also check special-challenge-like restrictions on pt (the limited-match states)
+            a_pt = get_user_pt(a)
+            b_pt = get_user_pt(b)
+            def challenge_ok(my_pt, other_pt):
+                if my_pt in (3,8,13,18,23):
+                    return other_pt >= my_pt
+                if my_pt in (4,9,14,19,24):
+                    return (other_pt >= my_pt) or (other_pt == my_pt - 1)
+                return True
+            if not challenge_ok(a_pt, b_pt) or not challenge_ok(b_pt, a_pt):
+                continue
+            # pair them
+            paired.add(a); paired.add(b)
+            pairs.append((a, b))
+            break
+    # For each pair, register matching and notify both
+    for a, b in pairs:
+        # remove from hope_list and cancel timers
         hope_list.pop(a, None)
+        t = hope_timers.pop(a, None)
+        if t and not t.done():
+            t.cancel()
         hope_list.pop(b, None)
-        drawing_pool.discard(a)
-        drawing_pool.discard(b)
+        t = hope_timers.pop(b, None)
+        if t and not t.done():
+            t.cancel()
+        # register matching (both directions)
+        matching[a] = b
+        matching[b] = a
+        # notify publicly in origin_channel
+        try:
+            await origin_channel.send(f"<@{a}> と <@{b}> のマッチングが成立しました。試合後、勝者が /結果報告 を行なってください。")
+        except Exception:
+            logger.debug("Failed to send match-formed message to origin channel.")
+    # leftover participants are kept in hope_list (per spec), so do nothing else
+    return
 
-    # Remove paired from drawing_pool. Unpaired remain in hope_list but removed from drawing_pool
-    for u in list(unpaired):
-        drawing_pool.discard(u)
+async def schedule_remove_wish(user_id: int):
+    """
+    Called when a user issues /マッチ希望. Wait MATCH_WISH_TTL and then remove them if still present.
+    We keep a handle so we can cancel if they withdraw earlier or are matched.
+    """
+    await asyncio.sleep(MATCH_WISH_TTL)
+    if user_id in hope_list:
+        hope_list.pop(user_id, None)
+    # clear timer entry
+    hope_timers.pop(user_id, None)
 
-    # Send notifications (public) about pairings.
-    # For notifications, post into the guild's default channel; prefer a text channel that exists.
-    # We'll find an appropriate text channel from the guilds (we assume single guild GUILD_ID)
-    guild = bot.get_guild(GUILD_ID)
-    if not guild:
-        return
+# ---------- Views (Buttons) ----------
 
-    # choose a channel to post notifications: try system channel > first text channel > None
-    channel = None
-    if guild.system_channel:
-        channel = guild.system_channel
-    else:
-        for ch in guild.text_channels:
-            # Ensure bot has permission to send message
-            perms = ch.permissions_for(guild.me)
-            if perms.send_messages:
-                channel = ch
-                break
-
-    if channel is None:
-        # can't notify
-        return
-
-    for a,b in paired:
-        # mention both and instruct winner to /結果報告
-        await channel.send(f"<@{a}> と <@{b}> のマッチが成立しました！ 試合後、勝者が /結果報告 を行なってください。")
-
-# -----------------------
-# Views for Buttons (Approve / Dispute)
-# -----------------------
-class ResultApproveView(discord.ui.View):
-    def __init__(self, winner_id:int, loser_id:int, origin_channel_id:int, interaction_user_id:int):
+class ApproveMatchView(discord.ui.View):
+    """
+    For manual direct match request: allows the target to approve.
+    Only the target can press Approve.
+    """
+    def __init__(self, applicant_id:int, opponent_id:int, origin_channel_id:int):
         super().__init__(timeout=None)
-        self.winner_id = winner_id
-        self.loser_id = loser_id
+        self.applicant_id = applicant_id
+        self.opponent_id = opponent_id
         self.origin_channel_id = origin_channel_id
-        self.interaction_user_id = interaction_user_id
-        self.processed = False
-
-    async def _finalize_autoapprove(self):
-        """Called when auto-approve triggers or when approved"""
-        # apply pt changes
-        w_before = players.get(self.winner_id, {}).get("pt", 0)
-        l_before = players.get(self.loser_id, {}).get("pt", 0)
-        players.setdefault(self.winner_id, {})["pt"] = w_before + 1
-        players.setdefault(self.loser_id, {})["pt"] = max(l_before - 1, 0)
-
-        # update nicknames for both in guild
-        guild = bot.get_guild(GUILD_ID)
-        if guild:
-            await update_member_display(guild, self.winner_id)
-            await update_member_display(guild, self.loser_id)
-
-        # remove from in_match
-        in_match.pop(self.winner_id, None)
-        in_match.pop(self.loser_id, None)
 
     @discord.ui.button(label="承認", style=discord.ButtonStyle.success)
-    async def approve_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # only loser can press
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # only the opponent can approve
+        if interaction.user.id != self.opponent_id:
+            await interaction.response.send_message("承認できるのは申請された相手のみです。", ephemeral=True)
+            return
+        # make matching
+        matching[self.applicant_id] = self.opponent_id
+        matching[self.opponent_id] = self.applicant_id
+        guild = interaction.guild
+        ch = guild.get_channel(self.origin_channel_id) if self.origin_channel_id else interaction.channel
+        if ch:
+            await ch.send(f"<@{self.applicant_id}> と <@{self.opponent_id}> のマッチングが成立しました。試合後、勝者が /結果報告 を行なってください。")
+        await interaction.response.send_message("承認しました。", ephemeral=True)
+        self.stop()
+
+class CancelExistingMatchView(discord.ui.View):
+    """
+    If someone tries to apply to a user who is already in a match, prompt to cancel existing match.
+    Only applicant (the one seeing the prompt) can press the cancel button to cancel existing match pair.
+    """
+    def __init__(self, existing_a:int, existing_b:int):
+        super().__init__(timeout=60)
+        self.existing_a = existing_a
+        self.existing_b = existing_b
+
+    @discord.ui.button(label="取り消す", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # allow the one who sees it (the applicant) to cancel
+        a = self.existing_a
+        b = self.existing_b
+        if matching.get(a) == b:
+            matching.pop(a, None)
+            matching.pop(b, None)
+            await interaction.response.send_message(f"<@{a}> と <@{b}> のマッチングは解除されました。", ephemeral=False)
+        else:
+            await interaction.response.send_message("該当のマッチは既に解除されています。", ephemeral=True)
+        self.stop()
+
+class ResultApproveView(discord.ui.View):
+    """
+    View for loser to approve or dispute the result. Only the loser can interact.
+    """
+    def __init__(self, winner_id:int, loser_id:int):
+        super().__init__(timeout=RESULT_APPROVE_TIMEOUT)
+        self.winner_id = winner_id
+        self.loser_id = loser_id
+        self.processed = False
+
+    async def on_timeout(self):
+        # auto-approve if not processed
+        if not self.processed:
+            key = (self.winner_id, self.loser_id)
+            if key in result_pending:
+                info = result_pending.pop(key, None)
+                # call approved handler (channel from info)
+                channel = info.get("channel")
+                try:
+                    await handle_approved_result(self.winner_id, self.loser_id, channel)
+                except Exception:
+                    logger.exception("auto-approve failed")
+
+    @discord.ui.button(label="承認", style=discord.ButtonStyle.success)
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.loser_id:
             await interaction.response.send_message("これはあなたの試合ではないようです。", ephemeral=True)
             return
@@ -277,13 +385,11 @@ class ResultApproveView(discord.ui.View):
             await interaction.response.send_message("既に処理済みです。", ephemeral=True)
             return
         self.processed = True
-        # finalize
-        await self._finalize_autoapprove()
-        await interaction.response.edit_message(content=f"承認されました。結果を反映しました。", view=None)
+        await interaction.response.edit_message(content="承認されました。結果を反映します。", view=None)
+        await handle_approved_result(self.winner_id, self.loser_id, interaction.channel)
 
     @discord.ui.button(label="異議", style=discord.ButtonStyle.danger)
-    async def dispute_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # only loser can press
+    async def dispute(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.loser_id:
             await interaction.response.send_message("これはあなたの試合ではないようです。", ephemeral=True)
             return
@@ -291,188 +397,226 @@ class ResultApproveView(discord.ui.View):
             await interaction.response.send_message("既に処理済みです。", ephemeral=True)
             return
         self.processed = True
+        await interaction.response.edit_message(content="異議が申立てられました。審判チャンネルへ通知します。", view=None)
         # notify judge channel
-        guild = bot.get_guild(GUILD_ID)
-        judge_ch = guild.get_channel(JUDGE_CHANNEL_ID) if guild else None
+        guild = interaction.guild
+        judge_ch = guild.get_channel(JUDGE_CHANNEL_ID) if JUDGE_CHANNEL_ID else None
         if judge_ch:
-            await judge_ch.send(f"⚖️ 審議依頼: <@{self.winner_id}> vs <@{self.loser_id}> に異議が出ました。 このマッチングは無効扱いとなっています。審議結果を <@{ADMIN_ID}> にご報告ください。")
-        # remove match from in_match
-        in_match.pop(self.winner_id, None)
-        in_match.pop(self.loser_id, None)
-        # edit original message to indicate dispute
-        await interaction.response.edit_message(content="異議が申立てられました。審議チャンネルへ通知しました。", view=None)
+            await judge_ch.send(f"⚖️ 審議依頼: <@{self.winner_id}> vs <@{self.loser_id}> に異議が出ました。\nこのマッチングは無効扱いとなっています。審議結果を <@{ADMIN_ID}> にご報告ください。")
+        # remove matching
+        matching.pop(self.winner_id, None)
+        matching.pop(self.loser_id, None)
+        # clear pending
+        result_pending.pop((self.winner_id, self.loser_id), None)
 
-# -----------------------
-# Commands
-# -----------------------
-@bot.event
-async def on_ready():
-    print(f"{bot.user} is ready. Guilds: {[g.name for g in bot.guilds]}")
-    guild = bot.get_guild(GUILD_ID)
-    if guild:
-        # clear guild commands then resync
-        tree.clear_commands(guild=guild)  # NOTE: clear_commands is not awaitable
-        await tree.sync(guild=guild)
-        print("Guild commands cleared and synced.")
-    else:
-        print("指定した GUILD_ID のギルドが見つかりません。")
+# ---------- 結果処理 ----------
 
-# マッチ希望（ランダム）
-@tree.command(name="マッチ希望", description="ランダムマッチに参加（相手指定不要）", guild=discord.Object(id=GUILD_ID))
-async def cmd_match_request(interaction: discord.Interaction):
-    uid = interaction.user.id
-    # check if already in match
-    if uid in in_match:
-        await interaction.response.send_message("既にマッチ中です。", ephemeral=True)
-        return
-    # check if already requested
-    if uid in hope_list:
-        await interaction.response.send_message("既にマッチ希望中です。", ephemeral=True)
+def is_registered_match(a: int, b: int) -> bool:
+    return matching.get(a) == b and matching.get(b) == a
+
+async def handle_approved_result(winner_id:int, loser_id:int, channel: discord.abc.Messageable):
+    # validate registration
+    if not is_registered_match(winner_id, loser_id):
+        await channel.send("このマッチングは登録されていません。まずはマッチング申請をお願いします。")
         return
 
-    # add to hope list and drawing pool
-    hope_list[uid] = now_utc()
-    drawing_pool.add(uid)
-    # schedule draw timer: last join resets countdown
-    async with _draw_task_lock:
-        schedule_draw(DRAW_WAIT_SECONDS)
+    winner_pt_before = get_user_pt(winner_id)
+    loser_pt_before = get_user_pt(loser_id)
+    w_delta, l_delta = calculate_pt_change(winner_pt_before, loser_pt_before)
 
-    await interaction.response.send_message("マッチ希望を受け付けました。抽選が行われます。", ephemeral=True)
-
-# マッチ希望取下げ
-@tree.command(name="マッチ希望取下げ", description="マッチ希望を取り下げます", guild=discord.Object(id=GUILD_ID))
-async def cmd_cancel_request(interaction: discord.Interaction):
-    uid = interaction.user.id
-    if uid in hope_list:
-        hope_list.pop(uid, None)
-        drawing_pool.discard(uid)
-        await interaction.response.send_message("マッチ希望を取り下げました。", ephemeral=True)
+    # apply loss exception downgrade if losing pt is one of special cases BEFORE applying delta?
+    # The spec says: on loss, revert to specific values; but general logic applied as per spec: implement loss downgrade override.
+    # We'll first compute provisional loser_pt_after = loser_pt_before + l_delta, then if loser_pt_before in exception set, set to provided floor.
+    provisional_loser_after = loser_pt_before + l_delta
+    # check exception
+    special = apply_rank_edge_cases_after_loss(provisional_loser_after)
+    if special is not None:
+        loser_new = special
     else:
+        loser_new = provisional_loser_after
+        if loser_new < 0:
+            loser_new = 0
+
+    winner_new = winner_pt_before + w_delta
+    if winner_new < 0:
+        winner_new = 0
+
+    # write back
+    set_user_pt(winner_id, winner_new)
+    set_user_pt(loser_id, loser_new)
+
+    # reflect changes to guild members (all guilds bot is in)
+    for g in bot.guilds:
+        await update_member_display(g, winner_id)
+        await update_member_display(g, loser_id)
+
+    # remove matching
+    matching.pop(winner_id, None)
+    matching.pop(loser_id, None)
+    # remove pending result
+    result_pending.pop((winner_id, loser_id), None)
+
+    # send result message
+    delta_w = winner_new - winner_pt_before
+    delta_l = loser_new - loser_pt_before
+    await channel.send(f"✅ <@{winner_id}> に +{delta_w}pt／<@{loser_id}> に {delta_l}pt の反映を行いました。")
+
+# ---------- コマンド群 ----------
+
+@tree.command(name="マッチ希望", description="ランダムマッチにエントリーします。相手指定は不要です。")
+async def cmd_match_wish(interaction: discord.Interaction):
+    user = interaction.user
+    uid = user.id
+    # if already in match, cannot enter
+    if uid in matching:
+        opp = matching[uid]
+        await interaction.response.send_message(f"<@{opp}> との試合が既に成立中です。試合を終えてから再度申請してください。", ephemeral=True)
+        return
+    # if already in hope list
+    if uid in hope_list:
+        await interaction.response.send_message("既にマッチ希望が出ています。", ephemeral=True)
+        return
+    # add to hope_list
+    hope_list[uid] = asyncio.get_event_loop().time()
+    # schedule removal after TTL
+    t = asyncio.create_task(schedule_remove_wish(uid))
+    hope_timers[uid] = t
+    # if there's at least one other waiting, start draw
+    # notify only the user
+    await interaction.response.send_message("マッチング希望を受け付けました。 マッチングが成立した場合、そのチャンネルにて通知されます。", ephemeral=True)
+    # start draw on the channel where command executed
+    await start_draw_if_needed(interaction.guild, interaction.channel)
+
+@tree.command(name="マッチ希望取下げ", description="マッチ希望を取り下げます（自分のみ有効）。")
+async def cmd_cancel_wish(interaction: discord.Interaction):
+    uid = interaction.user.id
+    if uid not in hope_list:
         await interaction.response.send_message("あなたのマッチ希望は見つかりません。", ephemeral=True)
+        return
+    # cancel timer
+    hope_list.pop(uid, None)
+    t = hope_timers.pop(uid, None)
+    if t and not t.done():
+        t.cancel()
+    await interaction.response.send_message("マッチ希望を取り下げました。", ephemeral=True)
 
-# 結果報告（勝者が実行）
-@tree.command(name="結果報告", description="勝者が対戦結果を報告します（敗者承認フローあり）", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(opponent="敗者のメンバー（メンション）")
+@tree.command(name="結果報告", description="（勝者用）対戦結果を報告します。敗者を指定してください。")
+@app_commands.describe(opponent="敗者のメンバー")
 async def cmd_report_result(interaction: discord.Interaction, opponent: discord.Member):
     winner = interaction.user
     loser = opponent
-    # must be a registered match (both directions)
-    if in_match.get(winner.id) != loser.id or in_match.get(loser.id) != winner.id:
-        await interaction.response.send_message("このマッチングは登録されていません。まずはマッチ希望～抽選で成立した対戦であるか確認してください。", ephemeral=True)
+    if not is_registered_match(winner.id, loser.id):
+        await interaction.response.send_message("このマッチングは登録されていません。まずはマッチ申請をお願いします。", ephemeral=True)
         return
-
-    # send approval UI to channel (public message with buttons)
-    channel = interaction.channel
-    # create view that only allows loser to approve/dispute
-    view = ResultApproveView(winner.id, loser.id, origin_channel_id=channel.id if channel else None, interaction_user_id=interaction.user.id)
-    content = f"この試合の勝者は <@{winner.id}> です。敗者の <@{loser.id}> は承認または異議を押してください。承認がない場合は {RESULT_APPROVE_SECONDS//60} 分で自動承認されます。"
-    await interaction.response.send_message(content, view=view, ephemeral=False)
-
-    # schedule auto-approve
+    # send approval view to channel (no DM)
+    view = ResultApproveView(winner.id, loser.id)
+    content = f"この試合の勝者は <@{winner.id}> です。結果に同意しますか？（承認：勝者の申告どおり／異議：審判へ）"
+    sent = await interaction.channel.send(content, view=view)
+    # place entry in result_pending with auto-approve timer
+    # We'll store channel so auto-approve can call handle_approved_result
     key = (winner.id, loser.id)
-    async def auto_approve_task():
-        await asyncio.sleep(RESULT_APPROVE_SECONDS)
-        # If still registered as a match and not processed, auto-approve
-        # We can send a synthesized approval if still in in_match
-        if in_match.get(winner.id) == loser.id and in_match.get(loser.id) == winner.id:
-            # apply pt changes
-            w_before = players.get(winner.id, {}).get("pt", 0)
-            l_before = players.get(loser.id, {}).get("pt", 0)
-            players.setdefault(winner.id, {})["pt"] = w_before + 1
-            players.setdefault(loser.id, {})["pt"] = max(l_before - 1, 0)
-            # update displays
-            guild = bot.get_guild(GUILD_ID)
-            if guild:
-                await update_member_display(guild, winner.id)
-                await update_member_display(guild, loser.id)
-            # remove from in_match
-            in_match.pop(winner.id, None)
-            in_match.pop(loser.id, None)
-            # send message to channel to indicate auto-approval occurred
-            try:
-                ch = channel or (bot.get_guild(GUILD_ID).system_channel if bot.get_guild(GUILD_ID) else None)
-                if ch:
-                    await ch.send(f"承認がありませんでした。<@{winner.id}> の勝利を自動承認し、Ptを反映しました。")
-            except Exception:
-                pass
+    # store info
+    result_pending[key] = {"message": sent, "channel": interaction.channel}
+    # immediate feedback to reporter
+    await interaction.response.send_message("結果報告を受け付けました。敗者の承認を待ちます。", ephemeral=True)
+    # Start an auto-approve task: handled by ResultApproveView on_timeout using timeout above, so nothing more to do here.
 
-    # start background auto-approve
-    task = asyncio.create_task(auto_approve_task())
-    pending_results[(winner.id, loser.id)] = {"task": task, "created": now_utc()}
-
-# 管理者: 全初期化
-@tree.command(name="admin_reset_all", description="管理者: 全ユーザーのPTと表示をリセット（全員0pt）", guild=discord.Object(id=GUILD_ID))
-async def cmd_admin_reset_all(interaction: discord.Interaction):
-    if interaction.user.id != ADMIN_ID:
-        await interaction.response.send_message("権限がありません。", ephemeral=True)
+@tree.command(name="ランキング", description="現在のランキングを表示します（全ユーザー使用可）。")
+async def cmd_ranking(interaction: discord.Interaction):
+    # Build ranking: sort by pt desc. Use standard competition ranking for ties.
+    items = [(uid, user_data.get(uid, {}).get("pt", 0)) for uid in user_data.keys()]
+    # ensure all guild members are included as needed
+    # also include members in guild who might not yet be in user_data (default pt 0)
+    guild = interaction.guild
+    for m in guild.members:
+        if m.bot:
+            continue
+        if m.id not in [x[0] for x in items]:
+            items.append((m.id, get_user_pt(m.id)))
+    # sort
+    items.sort(key=lambda x: x[1], reverse=True)
+    # standard competition ranking (1,2,2,4)
+    ranking_lines = []
+    last_score = None
+    rank = 0
+    display_rank = 0
+    for uid, pt in items:
+        rank += 1
+        if pt != last_score:
+            display_rank = rank
+            last_score = pt
+        # display simple username (use member.name to avoid duplicated icons)
+        member = guild.get_member(uid)
+        name = member.name if member else str(uid)
+        role_name, icon = get_rank_info_by_pt(pt)
+        ranking_lines.append(f"{display_rank}位 {name} {icon} {pt}pt")
+    if not ranking_lines:
+        await interaction.response.send_message("ランキングデータがありません。", ephemeral=True)
         return
-    # set all tracked players to 0
-    for uid in list(players.keys()):
-        players[uid]["pt"] = 0
-    # update nicknames
-    guild = bot.get_guild(GUILD_ID)
-    if guild:
-        for uid in players.keys():
-            await update_member_display(guild, uid)
-    await interaction.response.send_message("全ユーザーのPTを0にリセットしました。", ephemeral=True)
+    # send ephemeral to invoker with full list
+    await interaction.response.send_message("\n".join(ranking_lines), ephemeral=True)
 
-# 管理者: ユーザーPT設定
-@tree.command(name="admin_set_pt", description="管理者: ユーザーのPTを設定", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(member="対象メンバー", pt="設定するPT（0以上）")
-async def cmd_admin_set_pt(interaction: discord.Interaction, member: discord.Member, pt: int):
-    if interaction.user.id != ADMIN_ID:
-        await interaction.response.send_message("権限がありません。", ephemeral=True)
+# ---------- 管理者コマンド群 (ADMIN_ID only) ----------
+
+def is_admin(user: discord.User) -> bool:
+    return user.id == ADMIN_ID
+
+@tree.command(name="admin_set_pt", description="管理者: 指定ユーザーのPTを設定します（管理者のみ）。")
+@app_commands.describe(target="対象のメンバー", pt="設定するpt（整数）")
+async def cmd_admin_set_pt(interaction: discord.Interaction, target: discord.Member, pt: int):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("このコマンドは管理者専用です。", ephemeral=True)
         return
     if pt < 0:
-        await interaction.response.send_message("pt は 0 以上を指定してください。", ephemeral=True)
-        return
-    players.setdefault(member.id, {})["pt"] = pt
-    players[member.id]["updated"] = now_utc()
-    # update display
-    guild = bot.get_guild(GUILD_ID)
-    if guild:
-        await update_member_display(guild, member.id)
-    await interaction.response.send_message(f"{member.display_name} のPTを {pt} に設定しました。", ephemeral=True)
+        pt = 0
+    set_user_pt(target.id, pt)
+    # update display and roles across guilds
+    for g in bot.guilds:
+        await update_member_display(g, target.id)
+    await interaction.response.send_message(f"{target.display_name} のPTを {pt} に設定しました。", ephemeral=True)
 
-# /ランキング
-@tree.command(name="ランキング", description="現在のランキングを表示（誰でも使用可）", guild=discord.Object(id=GUILD_ID))
-async def cmd_ranking(interaction: discord.Interaction):
-    # ensure players known: if someone in guild not in players, include with 0
-    guild = bot.get_guild(GUILD_ID)
-    if guild:
-        for m in guild.members:
+@tree.command(name="admin_reset_all", description="管理者: 全ユーザーのPTと表示を初期化します（管理者のみ）。")
+async def cmd_admin_reset_all(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("このコマンドは管理者専用です。", ephemeral=True)
+        return
+    user_data.clear()
+    # reset nick/roles for all members in guilds
+    for g in bot.guilds:
+        for m in g.members:
             if m.bot:
                 continue
-            players.setdefault(m.id, {}).setdefault("pt", 0)
-    ranking = standard_competition_ranking()
-    if not ranking:
-        await interaction.response.send_message("ランキングはまだありません。", ephemeral=False)
-        return
-    # build display lines
-    lines = []
-    for rank_number, uid, pt in ranking:
-        member = bot.get_guild(GUILD_ID).get_member(uid)
-        display_name = member.display_name if member else f"<@{uid}>"
-        _, emoji = get_display_role(pt)
-        lines.append(f"{rank_number}位 {display_name} {emoji} {pt}pt")
-    text = "🏆 ランキング\n" + "\n".join(lines)
-    await interaction.response.send_message(text, ephemeral=False)
+            try:
+                await safe_update_nick(m, None)
+            except Exception:
+                pass
+            # remove rank roles
+            try:
+                rank_role_names = [r[2] for r in rank_definitions]
+                to_remove = [r for r in g.roles if r.name in rank_role_names and r in m.roles]
+                if to_remove:
+                    await m.remove_roles(*to_remove, reason="Admin reset")
+            except Exception:
+                pass
+    await interaction.response.send_message("全ユーザーのPTと表示を初期化しました。", ephemeral=True)
 
-# -----------------------
-# Background cleanup task: expire hope_list entries older than HOPE_TTL_SECONDS
-# -----------------------
-@tasks.loop(seconds=60)
-async def cleanup_task():
-    clean_expired_hopes()
+# ---------- Lifecycle: on_ready and command sync ----------
 
-@cleanup_task.before_loop
-async def before_cleanup():
-    await bot.wait_until_ready()
+@bot.event
+async def on_ready():
+    logger.info(f"{datetime.utcnow().isoformat()} - {bot.user} is ready. Guilds: {[g.name for g in bot.guilds]}")
+    # Sync commands to the specific guild for faster updates during development
+    try:
+        guild = discord.Object(id=GUILD_ID)
+        await tree.sync(guild=guild)
+        logger.info("Commands synced to guild.")
+    except Exception as e:
+        logger.exception("Failed to sync commands to guild: %s", e)
 
-cleanup_task.start()
+# ---------- Run ----------
 
-# -----------------------
-# Start bot
-# -----------------------
 if __name__ == "__main__":
-    bot.run(DISCORD_TOKEN)
+    try:
+        bot.run(TOKEN)
+    except Exception as e:
+        logger.exception("Bot raised an exception on run: %s", e)
