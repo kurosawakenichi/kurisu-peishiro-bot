@@ -2,7 +2,6 @@ import os
 import discord
 from discord import app_commands
 
-# 環境変数から取得
 TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = int(os.environ["GUILD_ID"])
 
@@ -12,17 +11,16 @@ class ClearCommandsClient(discord.Client):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
+    async def setup_hook(self):
+        guild = discord.Object(id=GUILD_ID)
+        # ①ローカルツリーから全部削除
+        self.tree._guild_commands[guild.id] = []  # ← 強制的に空にする
+        # ②そのまま同期（＝サーバーからも全部消える）
+        await self.tree.sync(guild=guild)
+
     async def on_ready(self):
         print(f"{self.user} is ready. Guild ID: {GUILD_ID}")
-        # ギルドオブジェクトを取得
-        guild = discord.Object(id=GUILD_ID)
-        try:
-            # ギルド上の全コマンドをクリア
-            await self.tree.clear_commands(guild=guild)
-            print("ギルドコマンドを全て削除しました。")
-        except Exception as e:
-            print("clear_commands エラー:", e)
-        # Botを終了
+        print("ギルドコマンドを全て削除しました。")
         await self.close()
 
 if __name__ == "__main__":
