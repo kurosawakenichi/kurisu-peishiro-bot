@@ -1,7 +1,6 @@
 import os
 import discord
 from discord import app_commands
-import asyncio
 
 # 環境変数から取得
 TOKEN = os.environ["DISCORD_TOKEN"]
@@ -13,24 +12,19 @@ class ClearCommandsClient(discord.Client):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
-    async def setup_hook(self):
-        # ギルド単位で削除
+    async def on_ready(self):
+        print(f"{self.user} is ready. Guild ID: {GUILD_ID}")
+        # ギルドオブジェクトを取得
         guild = discord.Object(id=GUILD_ID)
-        await self.tree.sync(guild=guild)  # 現状を同期
-        await self.tree.clear_commands(guild=guild)
-        print(f"ギルド {GUILD_ID} のコマンドをクリアしました")
-
-        # グローバル削除
-        await self.tree.sync()  # 現状を同期
-        await self.tree.clear_commands(guild=None)
-        print("グローバルコマンドをクリアしました")
-
-        # 完了後にBot停止
+        try:
+            # ギルド上の全コマンドをクリア
+            await self.tree.clear_commands(guild=guild)
+            print("ギルドコマンドを全て削除しました。")
+        except Exception as e:
+            print("clear_commands エラー:", e)
+        # Botを終了
         await self.close()
 
-async def main():
+if __name__ == "__main__":
     client = ClearCommandsClient()
-    await client.start(TOKEN)
-
-# Railwayでも安全に実行できるように asyncio.run で起動
-asyncio.run(main())
+    client.run(TOKEN)
