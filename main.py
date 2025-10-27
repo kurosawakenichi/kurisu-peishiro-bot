@@ -7,8 +7,8 @@ DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = int(os.environ["GUILD_ID"])
 
 intents = discord.Intents.default()
-intents.message_content = False
 intents.members = True
+intents.message_content = False  # ephemeralメッセージ前提なので不要
 
 class MyBot(commands.Bot):
     def __init__(self):
@@ -17,15 +17,15 @@ class MyBot(commands.Bot):
             intents=intents,
             application_id=None
         )
-        self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
+        # ここでは self.tree は既存のものを使う
         guild = discord.Object(id=GUILD_ID)
         try:
             await self.tree.sync(guild=guild)
             print("Commands synced to guild.")
         except Exception as e:
-            print("command sync error:", e)
+            print("Command sync error:", e)
 
 bot = MyBot()
 
