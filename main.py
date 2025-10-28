@@ -171,7 +171,7 @@ class ResultApproveView(discord.ui.View):
         await interaction.response.edit_message(content="異議が申立てられました。審判チャンネルへ通知します。", view=None)
         judge_ch = interaction.guild.get_channel(RANKING_CHANNEL_ID)
         if judge_ch:
-            await judge_ch.send(f"⚖️ 審議依頼: <@{self.winner_id}> vs <@{self.loser_id}> に異議が出ました。@<@{ADMIN_ID}> に連絡してください。")
+            await judge_ch.send(f"⚖️ 審議依頼: <@{self.winner_id}> vs <@{self.loser_id}> に異議が出ました。話し合いの上、結論が出たら@<@{ADMIN_ID}> に連絡してください。")
         matching.pop(self.winner_id, None)
         matching.pop(self.loser_id, None)
 
