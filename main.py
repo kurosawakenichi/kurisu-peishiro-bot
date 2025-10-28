@@ -14,19 +14,19 @@ DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = int(os.environ["GUILD_ID"])
 RANKING_CHANNEL_ID = int(os.environ["RANKING_CHANNEL_ID"])
 
-# JSTタイムゾーン
 JST = timezone(timedelta(hours=+9))
 
 # ----------------------------------------
 # 内部データ
 # ----------------------------------------
-user_data = {}       # user_id -> {"pt": int}
-matching = {}        # user_id -> opponent_id
-waiting_list = {}    # user_id -> {"added_at": datetime, "task": asyncio.Task}
+user_data = {}        # user_id -> {"pt": int}
+matching = {}         # user_id -> opponent_id
+waiting_list = {}     # user_id -> {"added_at": datetime, "task": asyncio.Task}
 waiting_lock = asyncio.Lock()
 
 # ----------------------------------------
 # ランク定義（6段階）
+# ----------------------------------------
 rank_roles = [
     (0, 4, "Beginner", "🔰"),
     (5, 9, "Silver", "🥈"),
@@ -117,11 +117,10 @@ async def try_match():
                 rank_i = get_internal_rank(user_data.get(users[i],{}).get("pt",0))
                 rank_j = get_internal_rank(user_data.get(users[j],{}).get("pt",0))
                 if abs(rank_i - rank_j) < 3:
-                    u1 = users[i]
-                    u2 = users[j]
+                    u1, u2 = users[i], users[j]
                     matching[u1] = u2
                     matching[u2] = u1
-                    # 待機リストから削除
+                    # 待機リスト削除
                     for uid in (u1,u2):
                         task = waiting_list[uid]["task"]
                         task.cancel()
@@ -139,13 +138,11 @@ async def try_match():
 # ----------------------------------------
 async def waiting_loop(user_id:int, interaction: discord.Interaction):
     try:
-        timeout_task = asyncio.create_task(asyncio.sleep(5*60))
-        done, pending = await asyncio.wait([timeout_task], return_when=asyncio.FIRST_COMPLETED)
-        if timeout_task in done:
-            async with waiting_lock:
-                if user_id in waiting_list:
-                    waiting_list.pop(user_id,None)
-                    await interaction.followup.send("マッチング相手が見つかりませんでした。", ephemeral=True)
+        await asyncio.sleep(5*60)  # 5分タイムアウト
+        async with waiting_lock:
+            if user_id in waiting_list:
+                waiting_list.pop(user_id,None)
+                await interaction.followup.send("マッチング相手が見つかりませんでした。", ephemeral=True)
     except asyncio.CancelledError:
         return
 
@@ -155,11 +152,8 @@ async def waiting_loop(user_id:int, interaction: discord.Interaction):
 @bot.tree.command(name="マッチ希望", description="ランダムマッチ希望")
 async def cmd_random_match(interaction: discord.Interaction):
     user_id = interaction.user.id
-    if user_id in matching:
-        await interaction.response.send_message("すでにマッチ中です。", ephemeral=True)
-        return
-    if user_id in waiting_list:
-        await interaction.response.send_message("すでに待機中です。", ephemeral=True)
+    if user_id in matching or user_id in waiting_list:
+        await interaction.response.send_message("すでにマッチ中または待機中です。", ephemeral=True)
         return
 
     await interaction.response.send_message("マッチング中です...", ephemeral=True)
@@ -168,7 +162,7 @@ async def cmd_random_match(interaction: discord.Interaction):
         task = asyncio.create_task(waiting_loop(user_id, interaction))
         waiting_list[user_id] = {"added_at": datetime.now(), "task": task}
 
-    await asyncio.sleep(5)
+    await asyncio.sleep(5)  # 5秒待機
     await try_match()
 
 # ----------------------------------------
@@ -234,7 +228,7 @@ async def handle_approved_result(winner_id:int, loser_id:int, channel: discord.a
     await channel.send(f"✅ <@{winner_id}> に +{delta_w}pt／<@{loser_id}> に {delta_l}pt の反映を行いました。")
 
 # ----------------------------------------
-# ランキング表示コマンド
+# ランキング表示
 # ----------------------------------------
 def standard_competition_ranking():
     sorted_users = sorted(user_data.items(), key=lambda x: x[1].get("pt",0), reverse=True)
@@ -290,13 +284,17 @@ async def admin_reset_all(interaction: discord.Interaction):
     await interaction.response.send_message("全ユーザーのPTを0にリセットしました。", ephemeral=True)
 
 # ----------------------------------------
-# on_ready と bot 実行（ギルド限定同期）
+# スラッシュコマンド同期タスク（全コマンド定義後に実行）
 # ----------------------------------------
-@bot.event
-async def on_ready():
-    print(f"{bot.user} is ready. Guilds: {[g.name for g in bot.guilds]}")
+async def sync_commands():
     guild = discord.Object(id=GUILD_ID)
+    await bot.wait_until_ready()
     await bot.tree.sync(guild=guild)
-    print("スラッシュコマンドをギルド限定で同期しました。")
+    print("ギルド限定スラッシュコマンドを同期しました。")
 
+bot.loop.create_task(sync_commands())
+
+# ----------------------------------------
+# bot 起動
+# ----------------------------------------
 bot.run(DISCORD_TOKEN)
