@@ -2,7 +2,7 @@ import os
 import asyncio
 import discord
 from discord import app_commands
-from discord.ext import tasks, commands
+from discord.ext import commands
 from datetime import datetime, timedelta, timezone
 import random
 
@@ -139,7 +139,6 @@ async def try_match():
 # ----------------------------------------
 async def waiting_loop(user_id:int, interaction: discord.Interaction):
     try:
-        # 5分で自動タイムアウト
         timeout_task = asyncio.create_task(asyncio.sleep(5*60))
         done, pending = await asyncio.wait([timeout_task], return_when=asyncio.FIRST_COMPLETED)
         if timeout_task in done:
@@ -169,7 +168,6 @@ async def cmd_random_match(interaction: discord.Interaction):
         task = asyncio.create_task(waiting_loop(user_id, interaction))
         waiting_list[user_id] = {"added_at": datetime.now(), "task": task}
 
-    # 5秒後に抽選
     await asyncio.sleep(5)
     await try_match()
 
@@ -292,11 +290,13 @@ async def admin_reset_all(interaction: discord.Interaction):
     await interaction.response.send_message("全ユーザーのPTを0にリセットしました。", ephemeral=True)
 
 # ----------------------------------------
-# on_ready と bot 実行
+# on_ready と bot 実行（ギルド限定同期）
 # ----------------------------------------
 @bot.event
 async def on_ready():
     print(f"{bot.user} is ready. Guilds: {[g.name for g in bot.guilds]}")
-    await bot.tree.sync()
+    guild = discord.Object(id=GUILD_ID)
+    await bot.tree.sync(guild=guild)
+    print("スラッシュコマンドをギルド限定で同期しました。")
 
 bot.run(DISCORD_TOKEN)
