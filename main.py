@@ -349,7 +349,13 @@ async def cmd_ranking(interaction: discord.Interaction):
         role, icon = get_rank_info(pt)
         member = interaction.guild.get_member(uid)
         if member:
-            lines.append(f"{rank}位 {member.display_name} {icon} {pt}pt")
+            # 🔽 ここで元名だけ抽出
+            display_name = member.display_name
+            words = display_name.split()
+            # 「末尾2つ(アイコン + PTpt)」を取り除いて元名を再構成
+            base_name = " ".join(words[:-2]) if len(words) > 2 else display_name
+
+            lines.append(f"{rank}位 {base_name} {icon} {pt}pt")
     await interaction.response.send_message("🏆 ランキング\n" + "\n".join(lines))
 
 # ----------------------------------------
