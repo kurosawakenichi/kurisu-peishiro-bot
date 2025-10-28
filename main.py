@@ -358,6 +358,7 @@ async def cmd_ranking(interaction: discord.Interaction):
             lines.append(f"{rank}位 {base_name} {icon} {pt}pt")
     await interaction.response.send_message("🏆 ランキング\n" + "\n".join(lines))
 
+
 # ----------------------------------------
 # 管理コマンド
 # ----------------------------------------
