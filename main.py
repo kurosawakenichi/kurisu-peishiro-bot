@@ -15,55 +15,33 @@ RANKING_CHANNEL_ID = int(os.environ["RANKING_CHANNEL_ID"])
 
 # JSTタイムゾーン
 JST = timezone(timedelta(hours=+9))
-
-# 自動承認までの秒数（15分）
 AUTO_APPROVE_SECONDS = 15 * 60
 
 # ----------------------------------------
 # 内部データ
 # ----------------------------------------
-# user_id -> {"pt": int}
-user_data = {}
-# 現在マッチ中のプレイヤー組み合わせ
-matching = {}
+user_data = {}      # user_id -> {"pt": int}
+matching = {}       # 現在マッチ中のプレイヤー組
 
-# ランク定義（表示用）
+# ----------------------------------------
+# ランク定義（表示用）6段階
 rank_roles = [
-    (0, 2, "Beginner", "🔰"),
-    (3, 3, "SilverChallenge1", "🔰🔥"),
-    (4, 4, "SilverChallenge2", "🔰🔥🔥"),
-    (5, 7, "Silver", "🥈"),
-    (8, 8, "GoldChallenge1", "🥈🔥"),
-    (9, 9, "GoldChallenge2", "🥈🔥🔥"),
-    (10, 12, "Gold", "🥇"),
-    (13, 13, "MasterChallenge1", "🥇🔥"),
-    (14, 14, "MasterChallenge2", "🥇🔥🔥"),
-    (15, 17, "Master", "⚔️"),
-    (18, 18, "GrandMasterChallenge1", "⚔️🔥"),
-    (19, 19, "GrandMasterChallenge2", "⚔️🔥🔥"),
-    (20, 22, "GrandMaster", "🪽"),
-    (23, 23, "ChallengerChallenge1", "🪽🔥"),
-    (24, 24, "ChallengerChallenge2", "🪽🔥🔥"),
+    (0, 4, "Beginner", "🔰"),
+    (5, 9, "Silver", "🥈"),
+    (10, 14, "Gold", "🥇"),
+    (15, 19, "Master", "⚔️"),
+    (20, 24, "GrandMaster", "🪽"),
     (25, 9999, "Challenger", "😈"),
 ]
 
-# 内部ランク階層（rank1..rank6）
+# 内部ランク階層
 rank_ranges_internal = {
-    1: range(0, 5),    # 0-4
-    2: range(5, 10),   # 5-9
-    3: range(10, 15),  # 10-14
-    4: range(15, 20),  # 15-19
-    5: range(20, 25),  # 20-24
-    6: range(25, 10000),# 25+
-}
-
-# 敗北時の降格先
-demotion_map = {
-    3: 2, 4: 2,
-    8: 7, 9: 7,
-    13: 12, 14: 12,
-    18: 17, 19: 17,
-    23: 22, 24: 22
+    1: range(0, 5),
+    2: range(5, 10),
+    3: range(10, 15),
+    4: range(15, 20),
+    5: range(20, 25),
+    6: range(25, 10000),
 }
 
 # ----------------------------------------
@@ -90,60 +68,26 @@ def get_internal_rank(pt: int):
     return 1
 
 # ----------------------------------------
-# PT計算
+# PT計算（勝敗 ±1 のみ）
 # ----------------------------------------
 def calculate_pt(my_pt: int, opp_pt: int, result: str) -> int:
-    my_rank = get_internal_rank(my_pt)
-    opp_rank = get_internal_rank(opp_pt)
-    delta = 0
-
-    if result == "win":
-        if my_rank == opp_rank:
-            delta = 1
-        elif my_rank + 1 == opp_rank:
-            delta = 2
-        elif my_rank + 2 == opp_rank:
-            delta = 3
-        elif my_rank - 1 == opp_rank:
-            delta = 1
-        elif my_rank - 2 == opp_rank:
-            delta = 1
-    elif result == "lose":
-        if my_rank == opp_rank:
-            delta = -1
-        elif my_rank + 1 == opp_rank:
-            delta = -1
-        elif my_rank + 2 == opp_rank:
-            delta = -1
-        elif my_rank - 1 == opp_rank:
-            delta = -2
-        elif my_rank - 2 == opp_rank:
-            delta = -3
-
+    delta = 1 if result == "win" else -1
     new_pt = my_pt + delta
-    # 降格処理
-    if new_pt in demotion_map and delta < 0:
-        new_pt = demotion_map[new_pt]
-    if new_pt < 0:
-        new_pt = 0
-    return new_pt
+    return max(new_pt, 0)
 
 # ----------------------------------------
-# メンバー表示更新（名前+PT+アイコン+ロール付与）
+# メンバー表示更新
 # ----------------------------------------
 async def update_member_display(member: discord.Member):
     pt = user_data.get(member.id, {}).get("pt", 0)
     role_name, icon = get_rank_info(pt)
     try:
         await member.edit(nick=f"{member.display_name.split(' ')[0]} {icon} {pt}pt")
-        # ロール付与
         guild = member.guild
-        # 既存ロール削除
         for r in rank_roles:
             role = discord.utils.get(guild.roles, name=r[2])
             if role and role in member.roles:
                 await member.remove_roles(role)
-        # 新しいロール追加
         new_role = discord.utils.get(guild.roles, name=role_name)
         if new_role:
             await member.add_roles(new_role)
@@ -278,31 +222,21 @@ async def cmd_match_request(interaction: discord.Interaction, opponent: discord.
 
     applicant_pt = user_data.get(applicant.id, {}).get("pt", 0)
     opponent_pt = user_data.get(opponent.id, {}).get("pt", 0)
+    applicant_rank = get_internal_rank(applicant_pt)
+    opponent_rank = get_internal_rank(opponent_pt)
 
-    if abs(get_internal_rank(applicant_pt) - get_internal_rank(opponent_pt)) >= 3:
+    # 3ランク以上離れている場合は不可
+    if abs(applicant_rank - opponent_rank) >= 3:
         await interaction.response.send_message("ランク差が大きすぎてマッチングできません。", ephemeral=True)
-        return
-
-    # チャレンジ中制約
-    def challenge_match_ok(my_pt, other_pt):
-        if my_pt in (3,4,8,9,13,14,18,19,23,24):
-            return get_internal_rank(my_pt) == get_internal_rank(other_pt)
-        return True
-
-    if not challenge_match_ok(applicant_pt, opponent_pt):
-        await interaction.response.send_message("昇級チャレンジ中のため、同rankの相手としかマッチできません。", ephemeral=True)
-        return
-    if not challenge_match_ok(opponent_pt, applicant_pt):
-        await interaction.response.send_message(f"{opponent.display_name} は昇級チャレンジ中のため、この申請はできません。", ephemeral=True)
         return
 
     view = ApproveMatchView(applicant.id, opponent.id, interaction.channel.id)
     content = f"<@{opponent.id}> に {applicant.display_name} からマッチ申請が届きました。承認してください。"
-    sent_msg = await interaction.channel.send(content, view=view)
+    await interaction.channel.send(content, view=view)
     await interaction.response.send_message(f"{opponent.display_name} にマッチング申請しました。承認を待ってください。", ephemeral=True)
 
 # ----------------------------------------
-# コマンド: 結果報告（勝者用）
+# 結果報告コマンド（勝者用）
 # ----------------------------------------
 @bot.tree.command(name="結果報告", description="勝者用：対戦結果を報告します")
 @app_commands.describe(opponent="敗者のメンバー")
@@ -313,7 +247,7 @@ async def cmd_report_result(interaction: discord.Interaction, opponent: discord.
         await interaction.response.send_message("このマッチングは登録されていません。", ephemeral=True)
         return
     content = f"この試合の勝者は <@{winner.id}> です。結果に同意しますか？"
-    sent_msg = await interaction.channel.send(content, view=ResultApproveView(winner.id, loser.id))
+    await interaction.channel.send(content, view=ResultApproveView(winner.id, loser.id))
     await interaction.response.send_message("結果報告を受け付けました。敗者の承認を待ちます。", ephemeral=True)
 
     async def auto_approve_task():
@@ -326,7 +260,6 @@ async def cmd_report_result(interaction: discord.Interaction, opponent: discord.
 # ランキング表示
 # ----------------------------------------
 def standard_competition_ranking():
-    # user_id -> pt
     sorted_users = sorted(user_data.items(), key=lambda x: x[1].get("pt",0), reverse=True)
     result = []
     prev_pt = None
@@ -349,15 +282,10 @@ async def cmd_ranking(interaction: discord.Interaction):
         role, icon = get_rank_info(pt)
         member = interaction.guild.get_member(uid)
         if member:
-            # 🔽 ここで元名だけ抽出
-            display_name = member.display_name
-            words = display_name.split()
-            # 「末尾2つ(アイコン + PTpt)」を取り除いて元名を再構成
-            base_name = " ".join(words[:-2]) if len(words) > 2 else display_name
-
+            words = member.display_name.split()
+            base_name = " ".join(words[:-2]) if len(words) > 2 else member.display_name
             lines.append(f"{rank}位 {base_name} {icon} {pt}pt")
     await interaction.response.send_message("🏆 ランキング\n" + "\n".join(lines))
-
 
 # ----------------------------------------
 # 管理コマンド
