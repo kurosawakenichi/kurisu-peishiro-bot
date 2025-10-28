@@ -2,7 +2,7 @@ import os
 import asyncio
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import tasks, commands
 from datetime import datetime, timedelta, timezone
 import random
 
@@ -12,20 +12,21 @@ import random
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = int(os.environ["GUILD_ID"])
+RANKING_CHANNEL_ID = int(os.environ["RANKING_CHANNEL_ID"])
 
+# JSTタイムゾーン
 JST = timezone(timedelta(hours=+9))
+AUTO_APPROVE_SECONDS = 300  # 5分
 
 # ----------------------------------------
 # 内部データ
 # ----------------------------------------
-user_data = {}        # user_id -> {"pt": int}
-matching = {}         # user_id -> opponent_id
-waiting_list = {}     # user_id -> {"added_at": datetime, "task": asyncio.Task}
-waiting_lock = asyncio.Lock()
+user_data = {}      # user_id -> {"pt": int}
+matching = {}       # 現在マッチ中のプレイヤー組
+waiting_list = {}   # user_id -> {"channel": channel, "expires": datetime, "task": asyncio.Task}
 
 # ----------------------------------------
-# ランク定義（6段階）
-# ----------------------------------------
+# ランク定義（表示用）6段階
 rank_roles = [
     (0, 4, "Beginner", "🔰"),
     (5, 9, "Silver", "🥈"),
@@ -36,12 +37,12 @@ rank_roles = [
 ]
 
 rank_ranges_internal = {
-    1: range(0,5),
-    2: range(5,10),
-    3: range(10,15),
-    4: range(15,20),
-    5: range(20,25),
-    6: range(25,10000),
+    1: range(0, 5),
+    2: range(5, 10),
+    3: range(10, 15),
+    4: range(15, 20),
+    5: range(20, 25),
+    6: range(25, 10000),
 }
 
 # ----------------------------------------
@@ -53,7 +54,7 @@ intents.members = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 
 # ----------------------------------------
-# ランク取得・内部ランク
+# ユーティリティ
 # ----------------------------------------
 def get_rank_info(pt: int):
     for start, end, role, icon in rank_roles:
@@ -67,18 +68,12 @@ def get_internal_rank(pt: int):
             return rank
     return 1
 
-# ----------------------------------------
-# PT計算（±1のみ）
-# ----------------------------------------
-def calculate_pt(my_pt:int, opp_pt:int, result:str) -> int:
-    delta = 1 if result=="win" else -1
-    return max(my_pt+delta, 0)
+def calculate_pt(my_pt: int, opp_pt: int, result: str) -> int:
+    delta = 1 if result == "win" else -1
+    return max(my_pt + delta, 0)
 
-# ----------------------------------------
-# メンバー表示更新
-# ----------------------------------------
 async def update_member_display(member: discord.Member):
-    pt = user_data.get(member.id,{}).get("pt",0)
+    pt = user_data.get(member.id, {}).get("pt", 0)
     role_name, icon = get_rank_info(pt)
     try:
         await member.edit(nick=f"{member.display_name.split(' ')[0]} {icon} {pt}pt")
@@ -93,74 +88,77 @@ async def update_member_display(member: discord.Member):
     except Exception as e:
         print(f"Error updating {member}: {e}")
 
-# ----------------------------------------
-# マッチチェック
-# ----------------------------------------
-def is_registered_match(a:int, b:int):
+def is_registered_match(a: int, b: int):
     return matching.get(a) == b and matching.get(b) == a
 
 # ----------------------------------------
 # マッチング処理
 # ----------------------------------------
-async def try_match(interaction: discord.Interaction):
-    async with waiting_lock:
-        users = list(waiting_list.keys())
-        random.shuffle(users)
-        matched = set()
-        for i in range(len(users)):
-            if users[i] in matched:
+async def try_match_users():
+    users = list(waiting_list.keys())
+    random.shuffle(users)
+    matched = set()
+    for i in range(len(users)):
+        if users[i] in matched:
+            continue
+        for j in range(i + 1, len(users)):
+            if users[j] in matched:
                 continue
-            for j in range(i+1, len(users)):
-                if users[j] in matched:
-                    continue
-                rank_i = get_internal_rank(user_data.get(users[i],{}).get("pt",0))
-                rank_j = get_internal_rank(user_data.get(users[j],{}).get("pt",0))
-                if abs(rank_i - rank_j) < 3:
-                    u1, u2 = users[i], users[j]
-                    matching[u1] = u2
-                    matching[u2] = u1
-                    # 待機リスト削除
-                    for uid in (u1,u2):
-                        task = waiting_list[uid]["task"]
-                        task.cancel()
-                        waiting_list.pop(uid,None)
-                    # 両者通知：/マッチ希望 実行チャンネル
-                    ch = interaction.channel
-                    await ch.send(f"<@{u1}> と <@{u2}> のマッチングが成立しました。試合後、勝者が /結果報告 を行ってください。")
-                    matched.update([u1,u2])
-                    break
+            u1, u2 = users[i], users[j]
+            pt1 = user_data.get(u1, {}).get("pt", 0)
+            pt2 = user_data.get(u2, {}).get("pt", 0)
+            rank1 = get_internal_rank(pt1)
+            rank2 = get_internal_rank(pt2)
+            if abs(rank1 - rank2) >= 3:
+                continue
+            # マッチ成立
+            ch1 = waiting_list[u1]["channel"]
+            ch2 = waiting_list[u2]["channel"]
+            msg_channel = ch1 or ch2
+            matching[u1] = u2
+            matching[u2] = u1
+            for uid in [u1, u2]:
+                task = waiting_list[uid]["task"]
+                task.cancel()
+                waiting_list.pop(uid, None)
+            await msg_channel.send(f"<@{u1}> と <@{u2}> のマッチングが成立しました。試合後、勝者が /結果報告 を行ってください。")
+            matched.update([u1, u2])
+            break
 
-# ----------------------------------------
-# 待機タスク
-# ----------------------------------------
-async def waiting_loop(user_id:int, interaction: discord.Interaction):
+async def remove_waiting(user_id: int):
+    if user_id in waiting_list:
+        channel = waiting_list[user_id]["channel"]
+        waiting_list.pop(user_id, None)
+        await channel.send(f"<@{user_id}> さん、マッチング相手が見つかりませんでした。", ephemeral=True)
+
+async def waiting_timer(user_id: int):
     try:
-        await asyncio.sleep(5*60)  # 5分タイムアウト
-        async with waiting_lock:
-            if user_id in waiting_list:
-                waiting_list.pop(user_id,None)
-                await interaction.followup.send("マッチング相手が見つかりませんでした。", ephemeral=True)
+        await asyncio.sleep(300)
+        await remove_waiting(user_id)
     except asyncio.CancelledError:
-        return
+        pass
 
 # ----------------------------------------
-# /マッチ希望 コマンド
+# /マッチ希望コマンド
 # ----------------------------------------
 @bot.tree.command(name="マッチ希望", description="ランダムマッチ希望")
-async def cmd_random_match(interaction: discord.Interaction):
-    user_id = interaction.user.id
-    if user_id in matching or user_id in waiting_list:
-        await interaction.response.send_message("すでにマッチ中または待機中です。", ephemeral=True)
+async def cmd_match_wish(interaction: discord.Interaction):
+    uid = interaction.user.id
+    if uid in matching:
+        await interaction.response.send_message("すでにマッチ済みです。", ephemeral=True)
         return
-
-    await interaction.response.send_message("マッチング中です...", ephemeral=True)
-
-    async with waiting_lock:
-        task = asyncio.create_task(waiting_loop(user_id, interaction))
-        waiting_list[user_id] = {"added_at": datetime.now(), "task": task}
-
-    await asyncio.sleep(5)  # 5秒待機
-    await try_match(interaction)
+    if uid in waiting_list:
+        await interaction.response.send_message("すでに待機中です。", ephemeral=True)
+        return
+    task = asyncio.create_task(waiting_timer(uid))
+    waiting_list[uid] = {"channel": interaction.channel, "expires": datetime.now(JST)+timedelta(seconds=300), "task": task}
+    await interaction.response.send_message("マッチング中です…", ephemeral=True)
+    # 待機タイマーをリセットして抽選
+    for uid2, info in waiting_list.items():
+        info["task"].cancel()
+        info["task"] = asyncio.create_task(waiting_timer(uid2))
+    await asyncio.sleep(5)
+    await try_match_users()
 
 # ----------------------------------------
 # 結果報告フロー
@@ -193,8 +191,10 @@ class ResultApproveView(discord.ui.View):
             await interaction.response.send_message("既に処理済みです。", ephemeral=True)
             return
         self.processed = True
-        await interaction.response.edit_message(content="異議が申立てられました。審判チャンネルへ通知します。", view=None)
-        # 待機リスト削除
+        await interaction.response.edit_message(content="異議が申立てられました。審議チャンネルへ通知します。", view=None)
+        judge_ch = interaction.guild.get_channel(RANKING_CHANNEL_ID)
+        if judge_ch:
+            await judge_ch.send(f"⚖️ 審議依頼: <@{self.winner_id}> vs <@{self.loser_id}> に異議が出ました。@<@{ADMIN_ID}> に連絡してください。")
         matching.pop(self.winner_id, None)
         matching.pop(self.loser_id, None)
 
@@ -221,6 +221,24 @@ async def handle_approved_result(winner_id:int, loser_id:int, channel: discord.a
     delta_w = winner_new - winner_pt
     delta_l = loser_new - loser_pt
     await channel.send(f"✅ <@{winner_id}> に +{delta_w}pt／<@{loser_id}> に {delta_l}pt の反映を行いました。")
+
+@bot.tree.command(name="結果報告", description="勝者用：対戦結果を報告します")
+@app_commands.describe(opponent="敗者のメンバー")
+async def cmd_report_result(interaction: discord.Interaction, opponent: discord.Member):
+    winner = interaction.user
+    loser = opponent
+    if not is_registered_match(winner.id, loser.id):
+        await interaction.response.send_message("このマッチングは登録されていません。", ephemeral=True)
+        return
+    content = f"この試合の勝者は <@{winner.id}> です。結果に同意しますか？"
+    await interaction.channel.send(content, view=ResultApproveView(winner.id, loser.id))
+    await interaction.response.send_message("結果報告を受け付けました。敗者の承認を待ちます。", ephemeral=True)
+    asyncio.create_task(auto_approve_result(winner.id, loser.id, interaction.channel))
+
+async def auto_approve_result(winner_id:int, loser_id:int, channel: discord.abc.Messageable):
+    await asyncio.sleep(AUTO_APPROVE_SECONDS)
+    if is_registered_match(winner_id, loser_id):
+        await handle_approved_result(winner_id, loser_id, channel)
 
 # ----------------------------------------
 # ランキング表示
@@ -279,17 +297,31 @@ async def admin_reset_all(interaction: discord.Interaction):
     await interaction.response.send_message("全ユーザーのPTを0にリセットしました。", ephemeral=True)
 
 # ----------------------------------------
-# スラッシュコマンド同期タスク
+# 自動ランキング投稿タスク
 # ----------------------------------------
-async def sync_commands():
-    guild = discord.Object(id=GUILD_ID)
-    await bot.wait_until_ready()
-    await bot.tree.sync(guild=guild)
-    print("ギルド限定スラッシュコマンドを同期しました。")
+@tasks.loop(minutes=60)
+async def auto_post_ranking():
+    now = datetime.now(JST)
+    if now.hour in (14, 23) and now.minute == 0:
+        guild = bot.get_guild(GUILD_ID)
+        ch = guild.get_channel(RANKING_CHANNEL_ID)
+        if ch:
+            rankings = standard_competition_ranking()
+            lines = []
+            for rank, uid, pt in rankings:
+                role, icon = get_rank_info(pt)
+                member = guild.get_member(uid)
+                if member:
+                    lines.append(f"{rank}位 {member.display_name} {icon} {pt}pt")
+            await ch.send("🏆 自動ランキング\n" + "\n".join(lines))
 
-bot.loop.create_task(sync_commands())
+# ----------------------------------------
+# 起動処理
+# ----------------------------------------
+@bot.event
+async def on_ready():
+    print(f"{bot.user} is ready. Guilds: {[g.name for g in bot.guilds]}")
+    await bot.tree.sync()
+    auto_post_ranking.start()
 
-# ----------------------------------------
-# bot 起動
-# ----------------------------------------
 bot.run(DISCORD_TOKEN)
