@@ -12,7 +12,6 @@ import random
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = int(os.environ["GUILD_ID"])
-RANKING_CHANNEL_ID = int(os.environ["RANKING_CHANNEL_ID"])
 
 JST = timezone(timedelta(hours=+9))
 
@@ -103,7 +102,7 @@ def is_registered_match(a:int, b:int):
 # ----------------------------------------
 # マッチング処理
 # ----------------------------------------
-async def try_match():
+async def try_match(interaction: discord.Interaction):
     async with waiting_lock:
         users = list(waiting_list.keys())
         random.shuffle(users)
@@ -125,11 +124,9 @@ async def try_match():
                         task = waiting_list[uid]["task"]
                         task.cancel()
                         waiting_list.pop(uid,None)
-                    # 両者通知
-                    guild = bot.get_guild(GUILD_ID)
-                    ch = guild.get_channel(RANKING_CHANNEL_ID)
-                    if ch:
-                        await ch.send(f"<@{u1}> と <@{u2}> のマッチングが成立しました。試合後、勝者が /結果報告 を行ってください。")
+                    # 両者通知：/マッチ希望 実行チャンネル
+                    ch = interaction.channel
+                    await ch.send(f"<@{u1}> と <@{u2}> のマッチングが成立しました。試合後、勝者が /結果報告 を行ってください。")
                     matched.update([u1,u2])
                     break
 
@@ -163,7 +160,7 @@ async def cmd_random_match(interaction: discord.Interaction):
         waiting_list[user_id] = {"added_at": datetime.now(), "task": task}
 
     await asyncio.sleep(5)  # 5秒待機
-    await try_match()
+    await try_match(interaction)
 
 # ----------------------------------------
 # 結果報告フロー
@@ -197,9 +194,7 @@ class ResultApproveView(discord.ui.View):
             return
         self.processed = True
         await interaction.response.edit_message(content="異議が申立てられました。審判チャンネルへ通知します。", view=None)
-        judge_ch = interaction.guild.get_channel(RANKING_CHANNEL_ID)
-        if judge_ch:
-            await judge_ch.send(f"⚖️ 審議依頼: <@{self.winner_id}> vs <@{self.loser_id}> に異議が出ました。@<@{ADMIN_ID}> に連絡してください。")
+        # 待機リスト削除
         matching.pop(self.winner_id, None)
         matching.pop(self.loser_id, None)
 
@@ -284,7 +279,7 @@ async def admin_reset_all(interaction: discord.Interaction):
     await interaction.response.send_message("全ユーザーのPTを0にリセットしました。", ephemeral=True)
 
 # ----------------------------------------
-# スラッシュコマンド同期タスク（全コマンド定義後に実行）
+# スラッシュコマンド同期タスク
 # ----------------------------------------
 async def sync_commands():
     guild = discord.Object(id=GUILD_ID)
