@@ -126,7 +126,6 @@ async def try_match_users():
             for uid in [u1, u2]:
                 task = waiting_list[uid]["task"]
                 task.cancel()
-                waiting_list.pop(uid, None)
 
             # 専用チャンネル作成
             guild = bot.get_guild(GUILD_ID)
@@ -143,6 +142,19 @@ async def try_match_users():
             matching_channels[u1] = battle_ch.id
             matching_channels[u2] = battle_ch.id
             await battle_ch.send(f"<@{u1}> vs <@{u2}> のマッチングが成立しました。試合終了後、勝者が /結果報告 を行ってください。")
+
+            # 待機メッセージ更新
+            for uid in [u1, u2]:
+                interaction = waiting_list.get(uid, {}).get("interaction")
+                if interaction:
+                    try:
+                        await interaction.edit_original_response(
+                            content=f"✅ マッチング成立！ 専用チャンネル <#{battle_ch.id}> で試合を行ってください。",
+                            view=None
+                        )
+                    except Exception:
+                        pass
+                waiting_list.pop(uid, None)
 
             matched.update([u1, u2])
             break
@@ -310,15 +322,19 @@ async def handle_approved_result(winner_id:int, loser_id:int, guild: discord.Gui
 async def cmd_report_result(interaction: discord.Interaction, opponent: discord.Member):
     winner = interaction.user
     loser = opponent
+
+    # 専用チャンネルでのみ使用可能
+    battle_ch_id = matching_channels.get(winner.id)
+    if interaction.channel.id != battle_ch_id:
+        await interaction.response.send_message("このコマンドは専用対戦チャンネル内でのみ使用可能です。", ephemeral=True)
+        return
+
     if not is_registered_match(winner.id, loser.id):
         await interaction.response.send_message("このマッチングは登録されていません。", ephemeral=True)
         return
-    battle_ch_id = matching_channels.get(winner.id)
-    if not battle_ch_id:
-        await interaction.response.send_message("専用対戦チャンネルが見つかりません。", ephemeral=True)
-        return
+
     content = f"この試合の勝者は <@{winner.id}> です。結果に同意しますか？"
-    await interaction.guild.get_channel(battle_ch_id).send(content, view=ResultApproveView(winner.id, loser.id, battle_ch_id))
+    await interaction.channel.send(content, view=ResultApproveView(winner.id, loser.id, battle_ch_id))
     await interaction.response.send_message("結果報告を受け付けました。敗者の承認を待ちます。", ephemeral=True)
     asyncio.create_task(auto_approve_result(winner.id, loser.id, interaction.guild, battle_ch_id))
 
