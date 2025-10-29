@@ -25,7 +25,7 @@ AUTO_APPROVE_SECONDS = 300  # 5分
 # ----------------------------------------
 user_data = {}      # user_id -> {"pt": int}
 matching = {}       # 現在マッチ中のプレイヤー組
-waiting_list = {}   # user_id -> {"expires": datetime, "task": asyncio.Task}
+waiting_list = {}   # user_id -> {"expires": datetime, "task": asyncio.Task, "interaction": discord.Interaction}
 
 # ----------------------------------------
 # ランク定義（表示用）6段階
@@ -128,13 +128,12 @@ async def try_match_users():
 
 async def remove_waiting(user_id: int):
     if user_id in waiting_list:
+        interaction = waiting_list[user_id]["interaction"]
+        try:
+            await interaction.edit_original_response(content="⏱ マッチング相手が見つかりませんでした。")
+        except Exception:
+            pass  # interaction が消えていた場合は通知せず
         waiting_list.pop(user_id, None)
-        user = bot.get_user(user_id)
-        if user:
-            try:
-                await user.send("あなたのマッチング相手が見つかりませんでした。")
-            except:
-                pass
 
 async def waiting_timer(user_id: int):
     try:
@@ -172,13 +171,14 @@ async def cmd_match_wish(interaction: discord.Interaction):
         await interaction.response.send_message("すでに待機中です。", ephemeral=True)
         return
     task = asyncio.create_task(waiting_timer(uid))
-    waiting_list[uid] = {"expires": datetime.now(JST)+timedelta(seconds=300), "task": task}
+    waiting_list[uid] = {"expires": datetime.now(JST)+timedelta(seconds=300), "task": task, "interaction": interaction}
     view = CancelWaitingView(uid)
     await interaction.response.send_message("マッチング中です…", ephemeral=True, view=view)
     # 待機タイマーリセット
     for uid2, info in waiting_list.items():
         info["task"].cancel()
         info["task"] = asyncio.create_task(waiting_timer(uid2))
+        info["interaction"] = info.get("interaction", interaction)
     await asyncio.sleep(5)
     await try_match_users()
 
@@ -314,30 +314,13 @@ async def admin_reset_all(interaction: discord.Interaction):
     if interaction.user.id != ADMIN_ID:
         await interaction.response.send_message("権限がありません。", ephemeral=True)
         return
-
-    guild = interaction.guild
-    beginner_role = discord.utils.get(guild.roles, name="Beginner")
-    if not beginner_role:
-        await interaction.response.send_message("Beginner ロールが見つかりません。", ephemeral=True)
-        return
-
+    guild = bot.get_guild(GUILD_ID)
     for member in guild.members:
+        if member.bot:
+            continue
         user_data.setdefault(member.id, {})["pt"] = 0
-        # 全ランクロール削除
-        for r in rank_roles:
-            role = discord.utils.get(guild.roles, name=r[2])
-            if role and role in member.roles:
-                await member.remove_roles(role)
-        # Beginnerロール付与
-        await member.add_roles(beginner_role)
-        # ニックネーム更新
-        try:
-            base_name = member.display_name.split(' ')[0]
-            await member.edit(nick=f"{base_name} 🔰 0pt")
-        except Exception as e:
-            print(f"Error updating {member}: {e}")
-
-    await interaction.response.send_message("全メンバーのPTを0にリセットし、ランク・ニックネームを更新しました。", ephemeral=True)
+        await update_member_display(member)
+    await interaction.response.send_message("全ユーザーのPTを0にリセットしました。", ephemeral=True)
 
 # ----------------------------------------
 # 起動処理
