@@ -17,6 +17,7 @@ JUDGE_CHANNEL_ID = int(os.environ["JUDGE_CHANNEL_ID"])
 MATCHING_CHANNEL_ID = int(os.environ["MATCHING_CHANNEL_ID"])
 BATTLELOG_CHANNEL_ID = int(os.environ["BATTLELOG_CHANNEL_ID"])
 BATTLE_CATEGORY_ID = 1427541907579605012  # 固定
+ACTIVE_CHANNEL_ID = int(os.environ["ACTIVE_CHANNEL_ID"])  # #アクティブ0名 チャンネルID
 
 # JSTタイムゾーン
 JST = timezone(timedelta(hours=+9))
@@ -97,6 +98,19 @@ async def update_member_display(member: discord.Member):
 def is_registered_match(a: int, b: int):
     return matching.get(a) == b and matching.get(b) == a
 
+async def update_active_player_count():
+    """アクティブプレイヤー数（待機中＋対戦中）の更新"""
+    guild = bot.get_guild(GUILD_ID)
+    channel = guild.get_channel(ACTIVE_CHANNEL_ID)
+    if channel:
+        count = len(waiting_list) + len(matching)
+        # matching はペアで入っているので /2
+        count = len(waiting_list) + len(matching)//2
+        try:
+            await channel.edit(name=f"アクティブ{count}名")
+        except Exception as e:
+            print(f"Failed to update active count: {e}")
+
 # ----------------------------------------
 # マッチング処理
 # ----------------------------------------
@@ -142,10 +156,11 @@ async def try_match_users():
             matching_channels[u1] = battle_ch.id
             matching_channels[u2] = battle_ch.id
 
-            # 降参ボタンを含む初期メッセージ
+            # 降参ボタン付きマッチ開始メッセージ
             await battle_ch.send(
-                f"<@{u1}> vs <@{u2}> のマッチングが成立しました。\n試合終了後、勝者は /勝利報告 を行ってください。",
-                view=ForfeitView(u1, u2, battle_ch.id)
+                f"<@{u1}> vs <@{u2}> のマッチングが成立しました。\n"
+                f"勝者は /勝利報告 を使用してください。",
+                view=ConcedeView(u1, u2, battle_ch.id)
             )
 
             # 待機メッセージ更新
@@ -162,6 +177,7 @@ async def try_match_users():
                 waiting_list.pop(uid, None)
 
             matched.update([u1, u2])
+            await update_active_player_count()
             break
 
 # ----------------------------------------
@@ -176,6 +192,7 @@ async def remove_waiting(user_id: int):
         except Exception:
             pass
         waiting_list.pop(user_id, None)
+        await update_active_player_count()
 
 async def waiting_timer(user_id: int):
     try:
@@ -203,6 +220,7 @@ async def start_match_wish(interaction: discord.Interaction):
         info["interaction"] = info.get("interaction", interaction)
     await asyncio.sleep(5)
     await try_match_users()
+    await update_active_player_count()
 
 # ----------------------------------------
 # /マッチ希望 コマンド & ボタンビュー
@@ -217,6 +235,7 @@ class CancelWaitingView(discord.ui.View):
         if self.user_id in waiting_list:
             waiting_list[self.user_id]["task"].cancel()
             waiting_list.pop(self.user_id, None)
+            await update_active_player_count()
             await interaction.response.send_message("待機リストから削除しました。", ephemeral=True)
         self.stop()
 
@@ -238,94 +257,45 @@ async def cmd_match_wish(interaction: discord.Interaction):
     await start_match_wish(interaction)
 
 # ----------------------------------------
-# 降参ボタンビュー（専用チャンネル初期メッセージ用）
+# /勝利報告 コマンド
 # ----------------------------------------
-class ForfeitView(discord.ui.View):
-    def __init__(self, user1:int, user2:int, channel_id:int):
+class ConcedeView(discord.ui.View):
+    def __init__(self, user1:int, user2:int, battle_ch_id:int):
         super().__init__(timeout=None)
         self.user1 = user1
         self.user2 = user2
-        self.channel_id = channel_id
-
-    @discord.ui.button(label="降参", style=discord.ButtonStyle.danger)
-    async def forfeit(self, interaction: discord.Interaction, button: discord.ui.Button):
-        uid = interaction.user.id
-        if uid not in [self.user1, self.user2]:
-            await interaction.response.send_message("あなたの試合ではありません。", ephemeral=True)
-            return
-        winner = self.user2 if uid == self.user1 else self.user1
-        loser = uid
-        await interaction.response.send_message(f"<@{loser}> が降参しました。<@{winner}> の勝利です。", ephemeral=False)
-        await handle_approved_result(winner, loser, interaction.guild, self.channel_id)
-
-# ----------------------------------------
-# /勝利報告 コマンド（相手指定不要）
-# ----------------------------------------
-@bot.tree.command(name="勝利報告", description="勝者用：対戦結果を報告します")
-async def cmd_victory_report(interaction: discord.Interaction):
-    winner = interaction.user
-    battle_ch_id = matching_channels.get(winner.id)
-    if not battle_ch_id or interaction.channel.id != battle_ch_id:
-        await interaction.response.send_message("このコマンドは専用対戦チャンネル内でのみ使用可能です。", ephemeral=True)
-        return
-    loser_id = matching.get(winner.id)
-    if not loser_id:
-        await interaction.response.send_message("相手情報が見つかりません。", ephemeral=True)
-        return
-    content = f"この試合の勝者は <@{winner.id}> です。結果に同意しますか？"
-    await interaction.channel.send(content, view=ResultApproveView(winner.id, loser_id, battle_ch_id))
-    await interaction.response.send_message("結果報告を受け付けました。敗者の承認を待ちます。", ephemeral=True)
-    asyncio.create_task(auto_approve_result(winner.id, loser_id, interaction.guild, battle_ch_id))
-
-# ----------------------------------------
-# 結果承認・異議ビュー
-# ----------------------------------------
-class ResultApproveView(discord.ui.View):
-    def __init__(self, winner_id:int, loser_id:int, battle_ch_id:int):
-        super().__init__(timeout=None)
-        self.winner_id = winner_id
-        self.loser_id = loser_id
         self.battle_ch_id = battle_ch_id
         self.processed = False
 
-    async def log_battle_result(self, guild: discord.Guild, result_text: str):
-        log_ch = guild.get_channel(BATTLELOG_CHANNEL_ID)
-        if log_ch:
-            await log_ch.send(result_text)
-
-    @discord.ui.button(label="承認", style=discord.ButtonStyle.success)
-    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.loser_id:
-            await interaction.response.send_message("これはあなたの試合ではないようです。", ephemeral=True)
+    @discord.ui.button(label="降参", style=discord.ButtonStyle.danger)
+    async def concede(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id not in [self.user1, self.user2]:
+            await interaction.response.send_message("この試合の当事者ではありません。", ephemeral=True)
             return
         if self.processed:
             await interaction.response.send_message("既に処理済みです。", ephemeral=True)
             return
         self.processed = True
-        await interaction.response.edit_message(content="承認されました。結果を反映します。", view=None)
-        await handle_approved_result(self.winner_id, self.loser_id, interaction.guild, self.battle_ch_id)
+        winner_id = self.user2 if interaction.user.id == self.user1 else self.user1
+        loser_id = interaction.user.id
+        await handle_approved_result(winner_id, loser_id, interaction.guild, self.battle_ch_id)
+        await interaction.response.edit_message(content=f"<@{loser_id}> が降参しました。試合終了です。", view=None)
 
-    @discord.ui.button(label="異議", style=discord.ButtonStyle.danger)
-    async def dispute(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.loser_id:
-            await interaction.response.send_message("これはあなたの試合ではないようです。", ephemeral=True)
-            return
-        if self.processed:
-            await interaction.response.send_message("既に処理済みです。", ephemeral=True)
-            return
-        self.processed = True
-        await interaction.response.edit_message(content="異議が申立てられました。審議チャンネルへ通知します。", view=None)
-        judge_ch = interaction.guild.get_channel(JUDGE_CHANNEL_ID)
-        if judge_ch:
-            await judge_ch.send(f"⚖️ 審議依頼: <@{self.winner_id}> vs <@{self.loser_id}> に異議が出ました。@<@{ADMIN_ID}> に連絡してください。")
-        matching.pop(self.winner_id, None)
-        matching.pop(self.loser_id, None)
-        await self.log_battle_result(interaction.guild,
-            f"[異議発生] {datetime.now(JST).strftime('%Y-%m-%d %H:%M:%S')} - <@{self.winner_id}> vs <@{self.loser_id}>")
+@bot.tree.command(name="勝利報告", description="自分が勝者であることを報告します")
+async def cmd_victory_report(interaction: discord.Interaction):
+    winner_id = interaction.user.id
+    if winner_id not in matching_channels:
+        await interaction.response.send_message("あなたは現在試合中ではありません。", ephemeral=True)
+        return
+    battle_ch_id = matching_channels[winner_id]
+    loser_id = matching.get(winner_id)
+    if not loser_id:
+        await interaction.response.send_message("対戦相手が見つかりません。", ephemeral=True)
+        return
+    await handle_approved_result(winner_id, loser_id, interaction.guild, battle_ch_id)
+    await interaction.response.send_message("勝利報告を受け付けました。結果を反映しました。", ephemeral=True)
+    await update_active_player_count()
 
-# ----------------------------------------
-# 結果反映処理
-# ----------------------------------------
 async def handle_approved_result(winner_id:int, loser_id:int, guild: discord.Guild, battle_ch_id:int):
     if not is_registered_match(winner_id, loser_id):
         return
@@ -336,6 +306,7 @@ async def handle_approved_result(winner_id:int, loser_id:int, guild: discord.Gui
     user_data.setdefault(winner_id, {})["pt"] = winner_new
     user_data.setdefault(loser_id, {})["pt"] = loser_new
 
+    # メンバー表示更新
     w_member = guild.get_member(winner_id)
     l_member = guild.get_member(loser_id)
     if w_member:
@@ -345,11 +316,17 @@ async def handle_approved_result(winner_id:int, loser_id:int, guild: discord.Gui
 
     matching.pop(winner_id, None)
     matching.pop(loser_id, None)
+    matching_channels.pop(winner_id, None)
+    matching_channels.pop(loser_id, None)
 
+    # 対戦ログ記録
     log_ch = guild.get_channel(BATTLELOG_CHANNEL_ID)
     if log_ch:
-        await log_ch.send(f"[勝者確定] {datetime.now(JST).strftime('%Y-%m-%d %H:%M:%S')} - <@{winner_id}> 勝利 vs <@{loser_id}> 敗北")
+        await log_ch.send(
+            f"[勝者確定] {datetime.now(JST).strftime('%Y-%m-%d %H:%M:%S')} - <@{winner_id}> 勝利 vs <@{loser_id}> 敗北"
+        )
 
+    # 専用チャンネル削除
     battle_ch = guild.get_channel(battle_ch_id)
     if battle_ch:
         await battle_ch.delete()
@@ -359,10 +336,7 @@ async def handle_approved_result(winner_id:int, loser_id:int, guild: discord.Gui
     if log_ch:
         await log_ch.send(f"✅ <@{winner_id}> に +{delta_w}pt／<@{loser_id}> に {delta_l}pt の反映を行いました。")
 
-async def auto_approve_result(winner_id:int, loser_id:int, guild: discord.Guild, battle_ch_id:int):
-    await asyncio.sleep(AUTO_APPROVE_SECONDS)
-    if is_registered_match(winner_id, loser_id):
-        await handle_approved_result(winner_id, loser_id, guild, battle_ch_id)
+    await update_active_player_count()
 
 # ----------------------------------------
 # ランキング表示
@@ -431,5 +405,6 @@ async def admin_reset_all(interaction: discord.Interaction):
 async def on_ready():
     print(f"{bot.user} is ready. Guilds: {[g.name for g in bot.guilds]}")
     await bot.tree.sync()
+    await update_active_player_count()
 
 bot.run(DISCORD_TOKEN)
