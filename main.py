@@ -16,6 +16,7 @@ RANKING_CHANNEL_ID = int(os.environ["RANKING_CHANNEL_ID"])
 JUDGE_CHANNEL_ID = int(os.environ["JUDGE_CHANNEL_ID"])
 MATCHING_CHANNEL_ID = int(os.environ["MATCHING_CHANNEL_ID"])
 BATTLELOG_CHANNEL_ID = int(os.environ["BATTLELOG_CHANNEL_ID"])
+ACTIVE_CHANNEL_ID = int(os.environ["ACTIVE_CHANNEL_ID"])
 BATTLE_CATEGORY_ID = 1427541907579605012  # 固定
 
 # JSTタイムゾーン
@@ -97,6 +98,17 @@ async def update_member_display(member: discord.Member):
 def is_registered_match(a: int, b: int):
     return matching.get(a) == b and matching.get(b) == a
 
+async def update_active_channel():
+    """#アクティブ●名 を更新"""
+    guild = bot.get_guild(GUILD_ID)
+    ch = guild.get_channel(ACTIVE_CHANNEL_ID)
+    if ch:
+        count = len(waiting_list) + len(matching)
+        try:
+            await ch.edit(name=f"アクティブ{count}名")
+        except Exception as e:
+            print(f"Failed to update active channel: {e}")
+
 # ----------------------------------------
 # マッチング処理
 # ----------------------------------------
@@ -162,6 +174,7 @@ async def try_match_users():
                 waiting_list.pop(uid, None)
 
             matched.update([u1, u2])
+            await update_active_channel()
             break
 
 # ----------------------------------------
@@ -176,6 +189,7 @@ async def remove_waiting(user_id: int):
         except Exception:
             pass
         waiting_list.pop(user_id, None)
+        await update_active_channel()
 
 async def waiting_timer(user_id: int):
     try:
@@ -196,6 +210,7 @@ async def start_match_wish(interaction: discord.Interaction):
     waiting_list[uid] = {"expires": datetime.now(JST)+timedelta(seconds=300), "task": task, "interaction": interaction}
     view = CancelWaitingView(uid)
     await interaction.response.send_message("マッチング中です…", ephemeral=True, view=view)
+    await update_active_channel()
     # 待機タイマーリセット
     for uid2, info in waiting_list.items():
         info["task"].cancel()
@@ -218,6 +233,7 @@ class CancelWaitingView(discord.ui.View):
             waiting_list[self.user_id]["task"].cancel()
             waiting_list.pop(self.user_id, None)
             await interaction.response.send_message("待機リストから削除しました。", ephemeral=True)
+            await update_active_channel()
         self.stop()
 
 class RetryView(discord.ui.View):
@@ -322,6 +338,7 @@ class ResultApproveView(discord.ui.View):
         matching.pop(self.loser_id, None)
         await self.log_battle_result(interaction.guild,
             f"[異議発生] {datetime.now(JST).strftime('%Y-%m-%d %H:%M:%S')} - <@{self.winner_id}> vs <@{self.loser_id}>")
+        await update_active_channel()
 
 # ----------------------------------------
 # 結果反映処理
@@ -352,12 +369,16 @@ async def handle_approved_result(winner_id:int, loser_id:int, guild: discord.Gui
 
     battle_ch = guild.get_channel(battle_ch_id)
     if battle_ch:
+        await battle_ch.send("このチャンネルは自動的に削除されます。")
+        await asyncio.sleep(10)
         await battle_ch.delete()
 
     delta_w = winner_new - winner_pt
     delta_l = loser_new - loser_pt
     if log_ch:
         await log_ch.send(f"✅ <@{winner_id}> に +{delta_w}pt／<@{loser_id}> に {delta_l}pt の反映を行いました。")
+
+    await update_active_channel()
 
 async def auto_approve_result(winner_id:int, loser_id:int, guild: discord.Guild, battle_ch_id:int):
     await asyncio.sleep(AUTO_APPROVE_SECONDS)
@@ -410,6 +431,7 @@ async def admin_set_pt(interaction: discord.Interaction, user: discord.Member, p
     user_data.setdefault(user.id, {})["pt"] = pt
     await update_member_display(user)
     await interaction.response.send_message(f"{user.display_name} のPTを {pt} に設定しました。", ephemeral=True)
+    await update_active_channel()
 
 @bot.tree.command(name="admin_reset_all", description="全ユーザーのPTを0にリセット")
 async def admin_reset_all(interaction: discord.Interaction):
@@ -423,6 +445,7 @@ async def admin_reset_all(interaction: discord.Interaction):
         user_data.setdefault(member.id, {})["pt"] = 0
         await update_member_display(member)
     await interaction.response.send_message("全ユーザーのPTを0にリセットしました。", ephemeral=True)
+    await update_active_channel()
 
 # ----------------------------------------
 # 起動処理
@@ -431,5 +454,6 @@ async def admin_reset_all(interaction: discord.Interaction):
 async def on_ready():
     print(f"{bot.user} is ready. Guilds: {[g.name for g in bot.guilds]}")
     await bot.tree.sync()
+    await update_active_channel()
 
 bot.run(DISCORD_TOKEN)
