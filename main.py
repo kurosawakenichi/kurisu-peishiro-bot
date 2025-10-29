@@ -129,8 +129,12 @@ async def try_match_users():
 async def remove_waiting(user_id: int):
     if user_id in waiting_list:
         waiting_list.pop(user_id, None)
-        ch = bot.get_channel(MATCHING_CHANNEL_ID)
-        await ch.send(f"<@{user_id}> さん、マッチング相手が見つかりませんでした。")
+        user = bot.get_user(user_id)
+        if user:
+            try:
+                await user.send("あなたのマッチング相手が見つかりませんでした。")
+            except:
+                pass
 
 async def waiting_timer(user_id: int):
     try:
@@ -310,12 +314,30 @@ async def admin_reset_all(interaction: discord.Interaction):
     if interaction.user.id != ADMIN_ID:
         await interaction.response.send_message("権限がありません。", ephemeral=True)
         return
-    for uid in user_data.keys():
-        user_data[uid]["pt"] = 0
-        member = interaction.guild.get_member(uid)
-        if member:
-            await update_member_display(member)
-    await interaction.response.send_message("全ユーザーのPTを0にリセットしました。", ephemeral=True)
+
+    guild = interaction.guild
+    beginner_role = discord.utils.get(guild.roles, name="Beginner")
+    if not beginner_role:
+        await interaction.response.send_message("Beginner ロールが見つかりません。", ephemeral=True)
+        return
+
+    for member in guild.members:
+        user_data.setdefault(member.id, {})["pt"] = 0
+        # 全ランクロール削除
+        for r in rank_roles:
+            role = discord.utils.get(guild.roles, name=r[2])
+            if role and role in member.roles:
+                await member.remove_roles(role)
+        # Beginnerロール付与
+        await member.add_roles(beginner_role)
+        # ニックネーム更新
+        try:
+            base_name = member.display_name.split(' ')[0]
+            await member.edit(nick=f"{base_name} 🔰 0pt")
+        except Exception as e:
+            print(f"Error updating {member}: {e}")
+
+    await interaction.response.send_message("全メンバーのPTを0にリセットし、ランク・ニックネームを更新しました。", ephemeral=True)
 
 # ----------------------------------------
 # 起動処理
