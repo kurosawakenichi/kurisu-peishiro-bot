@@ -2,7 +2,7 @@ import os
 import asyncio
 import discord
 from discord import app_commands
-from discord.ext import tasks, commands
+from discord.ext import commands
 from datetime import datetime, timedelta, timezone
 import random
 
@@ -13,6 +13,8 @@ ADMIN_ID = int(os.environ["ADMIN_ID"])
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = int(os.environ["GUILD_ID"])
 RANKING_CHANNEL_ID = int(os.environ["RANKING_CHANNEL_ID"])
+JUDGE_CHANNEL_ID = int(os.environ["JUDGE_CHANNEL_ID"])
+MATCHING_CHANNEL_ID = int(os.environ["MATCHING_CHANNEL_ID"])
 
 # JSTタイムゾーン
 JST = timezone(timedelta(hours=+9))
@@ -23,10 +25,11 @@ AUTO_APPROVE_SECONDS = 300  # 5分
 # ----------------------------------------
 user_data = {}      # user_id -> {"pt": int}
 matching = {}       # 現在マッチ中のプレイヤー組
-waiting_list = {}   # user_id -> {"channel": channel, "expires": datetime, "task": asyncio.Task}
+waiting_list = {}   # user_id -> {"expires": datetime, "task": asyncio.Task}
 
 # ----------------------------------------
 # ランク定義（表示用）6段階
+# ----------------------------------------
 rank_roles = [
     (0, 4, "Beginner", "🔰"),
     (5, 9, "Silver", "🥈"),
@@ -112,24 +115,22 @@ async def try_match_users():
             if abs(rank1 - rank2) >= 3:
                 continue
             # マッチ成立
-            ch1 = waiting_list[u1]["channel"]
-            ch2 = waiting_list[u2]["channel"]
-            msg_channel = ch1 or ch2
             matching[u1] = u2
             matching[u2] = u1
             for uid in [u1, u2]:
                 task = waiting_list[uid]["task"]
                 task.cancel()
                 waiting_list.pop(uid, None)
-            await msg_channel.send(f"<@{u1}> と <@{u2}> のマッチングが成立しました。試合後、勝者が /結果報告 を行ってください。")
+            ch = bot.get_channel(MATCHING_CHANNEL_ID)
+            await ch.send(f"<@{u1}> と <@{u2}> のマッチングが成立しました。試合後、勝者が /結果報告 を行ってください。")
             matched.update([u1, u2])
             break
 
 async def remove_waiting(user_id: int):
     if user_id in waiting_list:
-        channel = waiting_list[user_id]["channel"]
         waiting_list.pop(user_id, None)
-        await channel.send(f"<@{user_id}> さん、マッチング相手が見つかりませんでした。", ephemeral=True)
+        ch = bot.get_channel(MATCHING_CHANNEL_ID)
+        await ch.send(f"<@{user_id}> さん、マッチング相手が見つかりませんでした。")
 
 async def waiting_timer(user_id: int):
     try:
@@ -141,8 +142,24 @@ async def waiting_timer(user_id: int):
 # ----------------------------------------
 # /マッチ希望コマンド
 # ----------------------------------------
+class CancelWaitingView(discord.ui.View):
+    def __init__(self, user_id:int):
+        super().__init__(timeout=None)
+        self.user_id = user_id
+
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.user_id in waiting_list:
+            waiting_list[self.user_id]["task"].cancel()
+            waiting_list.pop(self.user_id, None)
+            await interaction.response.send_message("待機リストから削除しました。", ephemeral=True)
+        self.stop()
+
 @bot.tree.command(name="マッチ希望", description="ランダムマッチ希望")
 async def cmd_match_wish(interaction: discord.Interaction):
+    if interaction.channel.id != MATCHING_CHANNEL_ID:
+        await interaction.response.send_message(f"このコマンドは <#{MATCHING_CHANNEL_ID}> でのみ使用可能です。", ephemeral=True)
+        return
     uid = interaction.user.id
     if uid in matching:
         await interaction.response.send_message("すでにマッチ済みです。", ephemeral=True)
@@ -151,9 +168,10 @@ async def cmd_match_wish(interaction: discord.Interaction):
         await interaction.response.send_message("すでに待機中です。", ephemeral=True)
         return
     task = asyncio.create_task(waiting_timer(uid))
-    waiting_list[uid] = {"channel": interaction.channel, "expires": datetime.now(JST)+timedelta(seconds=300), "task": task}
-    await interaction.response.send_message("マッチング中です…", ephemeral=True)
-    # 待機タイマーをリセットして抽選
+    waiting_list[uid] = {"expires": datetime.now(JST)+timedelta(seconds=300), "task": task}
+    view = CancelWaitingView(uid)
+    await interaction.response.send_message("マッチング中です…", ephemeral=True, view=view)
+    # 待機タイマーリセット
     for uid2, info in waiting_list.items():
         info["task"].cancel()
         info["task"] = asyncio.create_task(waiting_timer(uid2))
@@ -192,7 +210,7 @@ class ResultApproveView(discord.ui.View):
             return
         self.processed = True
         await interaction.response.edit_message(content="異議が申立てられました。審議チャンネルへ通知します。", view=None)
-        judge_ch = interaction.guild.get_channel(RANKING_CHANNEL_ID)
+        judge_ch = interaction.guild.get_channel(JUDGE_CHANNEL_ID)
         if judge_ch:
             await judge_ch.send(f"⚖️ 審議依頼: <@{self.winner_id}> vs <@{self.loser_id}> に異議が出ました。@<@{ADMIN_ID}> に連絡してください。")
         matching.pop(self.winner_id, None)
@@ -260,6 +278,9 @@ def standard_competition_ranking():
 
 @bot.tree.command(name="ランキング", description="PT順にランキング表示")
 async def cmd_ranking(interaction: discord.Interaction):
+    if interaction.channel.id != RANKING_CHANNEL_ID:
+        await interaction.response.send_message(f"このコマンドは <#{RANKING_CHANNEL_ID}> でのみ使用可能です。", ephemeral=True)
+        return
     rankings = standard_competition_ranking()
     lines = []
     for rank, uid, pt in rankings:
@@ -297,31 +318,11 @@ async def admin_reset_all(interaction: discord.Interaction):
     await interaction.response.send_message("全ユーザーのPTを0にリセットしました。", ephemeral=True)
 
 # ----------------------------------------
-# 自動ランキング投稿タスク
-# ----------------------------------------
-@tasks.loop(minutes=60)
-async def auto_post_ranking():
-    now = datetime.now(JST)
-    if now.hour in (14, 23) and now.minute == 0:
-        guild = bot.get_guild(GUILD_ID)
-        ch = guild.get_channel(RANKING_CHANNEL_ID)
-        if ch:
-            rankings = standard_competition_ranking()
-            lines = []
-            for rank, uid, pt in rankings:
-                role, icon = get_rank_info(pt)
-                member = guild.get_member(uid)
-                if member:
-                    lines.append(f"{rank}位 {member.display_name} {icon} {pt}pt")
-            await ch.send("🏆 自動ランキング\n" + "\n".join(lines))
-
-# ----------------------------------------
 # 起動処理
 # ----------------------------------------
 @bot.event
 async def on_ready():
     print(f"{bot.user} is ready. Guilds: {[g.name for g in bot.guilds]}")
     await bot.tree.sync()
-    auto_post_ranking.start()
 
 bot.run(DISCORD_TOKEN)
