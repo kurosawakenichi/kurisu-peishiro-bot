@@ -1,3 +1,6 @@
+技術的なことはよくわかりません。
+私が「main.py ランダム」に追記するにあたり、どこに追記すべきかを明確に指定してくれればそれで良いです。
+「main.py ランダム」は以下の通りです。
 import os
 import asyncio
 import discord
@@ -30,6 +33,38 @@ user_data = {}               # user_id -> {"pt": int}
 matching = {}                # 現在マッチ中のプレイヤー組
 waiting_list = {}            # user_id -> {"expires": datetime, "task": asyncio.Task, "interaction": discord.Interaction}
 matching_channels = {}       # user_id -> 専用チャンネルID（v2用）
+
+# ========================================
+# イベントタイマー用データとユーティリティ
+# ========================================
+
+event_config = {
+    "type": None,        # "single" / "long" / "unlimited"
+    "dates": None,       # 単発 or 長期イベントの日付範囲 (datetime or tuple)
+    "times": None,       # 長期イベントの時間帯リスト [(start, end), ...]
+    "active": False      # 現在マッチング可能か
+}
+
+# JST対応の現在時刻
+def now_jst():
+    return datetime.now(JST)
+
+# MATCHING_CHANNELの書き込み制御
+async def set_matching_channel_permission(bot, enable: bool):
+    guild = bot.get_guild(GUILD_ID)
+    ch = guild.get_channel(MATCHING_CHANNEL_ID)
+    overwrite = ch.overwrites_for(guild.default_role)
+    overwrite.send_messages = enable
+    await ch.set_permissions(guild.default_role, overwrite=overwrite)
+    event_config["active"] = enable
+
+# イベント通知用
+async def post_event_notice(bot, message: str):
+    guild = bot.get_guild(GUILD_ID)
+    ch = guild.get_channel(1427835216830926958)  # #お知らせ
+    if ch:
+        await ch.send(message)
+
 
 # ----------------------------------------
 # ランク定義（表示用）6段階
@@ -97,6 +132,39 @@ async def update_member_display(member: discord.Member):
 
 def is_registered_match(a: int, b: int):
     return matching.get(a) == b and matching.get(b) == a
+
+# ========================================
+# イベントスケジューラー
+# ========================================
+async def event_scheduler_loop(bot):
+    await bot.wait_until_ready()
+    while True:
+        if event_config["type"] == "single":
+            start, end = event_config["dates"]
+            if start <= now_jst() < end and not event_config["active"]:
+                await set_matching_channel_permission(bot, True)
+                await post_event_notice(bot, f"対戦開始！このチャンネルでマッチングが可能です")
+            elif now_jst() >= end and event_config["active"]:
+                await set_matching_channel_permission(bot, False)
+                await post_event_notice(bot, f"対戦終了！マッチ希望を締め切ります")
+        elif event_config["type"] == "long":
+            start_date, end_date = event_config["dates"]
+            for t_start, t_end in event_config["times"]:
+                today = now_jst().date()
+                if start_date <= today <= end_date:
+                    start_dt = datetime.combine(today, t_start, JST)
+                    end_dt   = datetime.combine(today, t_end, JST)
+                    if start_dt <= now_jst() < end_dt and not event_config["active"]:
+                        await set_matching_channel_permission(bot, True)
+                        await post_event_notice(bot, f"対戦開始！このチャンネルでマッチングが可能です")
+                    elif now_jst() >= end_dt and event_config["active"]:
+                        await set_matching_channel_permission(bot, False)
+                        await post_event_notice(bot, f"対戦終了！マッチ希望を締め切ります")
+        elif event_config["type"] == "unlimited" and not event_config["active"]:
+            await set_matching_channel_permission(bot, True)
+            await post_event_notice(bot, f"いつでもマッチング可能です")
+        await asyncio.sleep(30)  # 30秒ごとにチェック
+
 
 # ----------------------------------------
 # アクティブ状況ログ投稿（イベント別）
@@ -483,6 +551,49 @@ async def admin_reset_all(interaction: discord.Interaction):
         await update_member_display(member)
     await interaction.response.send_message("全ユーザーのPTを0にリセットしました。", ephemeral=True)
 
+# /単発イベント /長期イベント /無期限イベント コマンド
+@bot.tree.command(name="単発イベント", description="単発イベント設定")
+@app_commands.describe(start="開始日時 YYYY-MM-DD HH:MM", end="終了日時 YYYY-MM-DD HH:MM")
+async def cmd_single_event(interaction: discord.Interaction, start: str, end: str):
+    if interaction.user.id != ADMIN_ID:
+        await interaction.response.send_message("権限がありません。", ephemeral=True)
+        return
+    start_dt = datetime.strptime(start, "%Y-%m-%d %H:%M").replace(tzinfo=JST)
+    end_dt   = datetime.strptime(end, "%Y-%m-%d %H:%M").replace(tzinfo=JST)
+    event_config.update({"type":"single", "dates":(start_dt,end_dt)})
+    await post_event_notice(bot, f"現在のイベント設定🔽\n{start}〜{end}のみマッチング可能です")
+    await interaction.response.send_message("単発イベントを設定しました。", ephemeral=True)
+
+@bot.tree.command(name="長期イベント", description="長期イベント設定")
+@app_commands.describe(start_date="開始日 YYYY-MM-DD", end_date="終了日 YYYY-MM-DD", times="時間帯 HH:MM-HH:MM,複数可カンマ区切り")
+async def cmd_long_event(interaction: discord.Interaction, start_date: str, end_date: str, times: str):
+    if interaction.user.id != ADMIN_ID:
+        await interaction.response.send_message("権限がありません。", ephemeral=True)
+        return
+    s_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+    e_date = datetime.strptime(end_date, "%Y-%m-%d").date()
+    time_list = []
+    for t in times.split(","):
+        s,e = t.split("-")
+        s_dt = datetime.strptime(s, "%H:%M").time()
+        e_dt = datetime.strptime(e, "%H:%M").time()
+        time_list.append((s_dt, e_dt))
+    event_config.update({"type":"long", "dates":(s_date,e_date), "times":time_list})
+    notice = f"現在のイベント設定🔽\n{start_date}〜{end_date}の期間中、以下の時間帯のみマッチング可能です\n"
+    for s,e in time_list:
+        notice += f"・{s.strftime('%H:%M')}〜{e.strftime('%H:%M')}\n"
+    await post_event_notice(bot, notice)
+    await interaction.response.send_message("長期イベントを設定しました。", ephemeral=True)
+
+@bot.tree.command(name="無期限イベント", description="無期限イベント設定")
+async def cmd_unlimited_event(interaction: discord.Interaction):
+    if interaction.user.id != ADMIN_ID:
+        await interaction.response.send_message("権限がありません。", ephemeral=True)
+        return
+    event_config.update({"type":"unlimited"})
+    await post_event_notice(bot, "現在のイベント設定🔽\nいつでもマッチング可能です")
+    await interaction.response.send_message("無期限イベントを設定しました。", ephemeral=True)
+
 # ----------------------------------------
 # 起動処理
 # ----------------------------------------
@@ -490,5 +601,7 @@ async def admin_reset_all(interaction: discord.Interaction):
 async def on_ready():
     print(f"{bot.user} is ready. Guilds: {[g.name for g in bot.guilds]}")
     await bot.tree.sync()
+    # イベントタイマー開始
+    asyncio.create_task(event_scheduler_loop(bot))
 
 bot.run(DISCORD_TOKEN)
