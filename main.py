@@ -1,6 +1,3 @@
-技術的なことはよくわかりません。
-私が「main.py ランダム」に追記するにあたり、どこに追記すべきかを明確に指定してくれればそれで良いです。
-「main.py ランダム」は以下の通りです。
 import os
 import asyncio
 import discord
