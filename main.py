@@ -628,7 +628,12 @@ async def cmd_unlimited_event(interaction: discord.Interaction):
 async def on_ready():
     print(f"{bot.user} is ready. Guilds: {[g.name for g in bot.guilds]}")
     await bot.tree.sync()
-    # イベントタイマー開始
-    asyncio.create_task(event_scheduler_loop(bot))
+
+    # ===== イベントスケジューラー起動 =====
+    # ※ 多重起動防止用にフラグを持つ
+    if not hasattr(bot, "event_scheduler_started"):
+        bot.event_scheduler_started = True
+        asyncio.create_task(event_scheduler_loop(bot))
+        print("[INFO] イベントスケジューラーを起動しました")
 
 bot.run(DISCORD_TOKEN)
