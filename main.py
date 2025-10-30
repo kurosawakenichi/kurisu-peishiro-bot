@@ -155,11 +155,24 @@ async def set_matching_channel_permission(bot, allow: bool):
         print(f"[ERROR] チャンネル公開/非公開切替に失敗しました: {e}")
 
 
-async def post_event_notice(bot, message: str):
+async def post_event_notice(bot, message: str, to_matching_channel: bool = False):
+    """
+    イベント通知
+    - to_matching_channel=True なら MATCHING_CHANNEL に送信
+    - デフォルトは #お知らせ に送信
+    """
     guild = bot.get_guild(GUILD_ID)
-    ch = guild.get_channel(1427835216830926958)  # #お知らせ
+    if not guild:
+        return
+
+    if to_matching_channel:
+        ch = guild.get_channel(MATCHING_CHANNEL_ID)
+    else:
+        ch = guild.get_channel(1427835216830926958)  # #お知らせ
+
     if ch:
         await ch.send(message)
+
 
 # ========================================
 # イベントスケジューラー
@@ -172,10 +185,10 @@ async def event_scheduler_loop(bot):
             start, end = event_config["dates"]
             if start <= now < end and not event_config["active"]:
                 await set_matching_channel_permission(bot, True)
-                await post_event_notice(bot, "対戦開始！このチャンネルでマッチングが可能です")
+                await post_event_notice(bot, "対戦開始！このチャンネルでマッチングが可能です", to_matching_channel=True)
             elif now >= end and event_config["active"]:
                 await set_matching_channel_permission(bot, False)
-                await post_event_notice(bot, "対戦終了！マッチ希望を締め切ります")
+                await post_event_notice(bot, "対戦終了！マッチ希望を締め切ります", to_matching_channel=True)
 
         elif event_config["type"] == "long":
             start_date, end_date = event_config["dates"]
@@ -186,16 +199,17 @@ async def event_scheduler_loop(bot):
                     end_dt = datetime.combine(today, t_end, JST)
                     if start_dt <= now < end_dt and not event_config["active"]:
                         await set_matching_channel_permission(bot, True)
-                        await post_event_notice(bot, "対戦開始！このチャンネルでマッチングが可能です")
+                        await post_event_notice(bot, "対戦開始！このチャンネルでマッチングが可能です", to_matching_channel=True)
                     elif now >= end_dt and event_config["active"]:
                         await set_matching_channel_permission(bot, False)
-                        await post_event_notice(bot, "対戦終了！マッチ希望を締め切ります")
+                        await post_event_notice(bot, "対戦終了！マッチ希望を締め切ります", to_matching_channel=True)
 
         elif event_config["type"] == "unlimited" and not event_config["active"]:
             await set_matching_channel_permission(bot, True)
-            await post_event_notice(bot, "いつでもマッチング可能です")
+            await post_event_notice(bot, "いつでもマッチング可能です", to_matching_channel=True)
 
         await asyncio.sleep(30)
+
 
 
 
