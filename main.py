@@ -125,22 +125,27 @@ async def set_matching_channel_permission(bot, allow: bool):
 
     guild = channel.guild
     everyone = guild.default_role
+    admin_member = guild.get_member(ADMIN_ID)
 
     try:
         if allow:
-            overwrites = channel.overwrites
-            overwrites[everyone] = discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True
-            )
+            # 公開: everyone が閲覧・送信可能
+            overwrites = {
+                everyone: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+                bot.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+            }
+            if admin_member:
+                overwrites[admin_member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
             await channel.edit(overwrites=overwrites)
             print("[イベント制御] MATCHING_CHANNEL を公開しました。")
         else:
+            # 非公開: everyone は不可、Bot と管理者だけ可
             overwrites = {
+                everyone: discord.PermissionOverwrite(view_channel=False),
                 bot.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-                guild.get_member(ADMIN_ID): discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
             }
+            if admin_member:
+                overwrites[admin_member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
             await channel.edit(overwrites=overwrites)
             print("[イベント制御] MATCHING_CHANNEL をプライベート化しました。")
 
@@ -148,6 +153,7 @@ async def set_matching_channel_permission(bot, allow: bool):
 
     except Exception as e:
         print(f"[ERROR] チャンネル公開/非公開切替に失敗しました: {e}")
+
 
 async def post_event_notice(bot, message: str):
     guild = bot.get_guild(GUILD_ID)
