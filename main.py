@@ -483,6 +483,7 @@ async def admin_reset_all(interaction: discord.Interaction):
         await update_member_display(member)
     await interaction.response.send_message("全ユーザーのPTを0にリセットしました。", ephemeral=True)
 
+
 # ----------------------------------------
 # 起動処理
 # ----------------------------------------
