@@ -133,34 +133,64 @@ def is_registered_match(a: int, b: int):
 # ========================================
 # イベントスケジューラー
 # ========================================
+
+# チャンネル書き込み可否制御
+async def set_matching_channel_permission(bot, allow: bool):
+    """MATCHING_CHANNEL への一般ユーザーの書き込みを許可／禁止する"""
+    guild = bot.get_guild(GUILD_ID)
+    if not guild:
+        return
+    ch = guild.get_channel(MATCHING_CHANNEL_ID)
+    if not ch:
+        return
+    try:
+        overwrite = ch.overwrites_for(guild.default_role)
+        overwrite.send_messages = allow
+        await ch.set_permissions(guild.default_role, overwrite=overwrite)
+        state = "許可" if allow else "禁止"
+        print(f"[イベント制御] MATCHING_CHANNEL への書き込みを {state} にしました。")
+    except Exception as e:
+        print(f"Failed to update MATCHING_CHANNEL permissions: {e}")
+
+
+# イベントスケジューラー本体
 async def event_scheduler_loop(bot):
     await bot.wait_until_ready()
     while True:
         if event_config["type"] == "single":
             start, end = event_config["dates"]
             if start <= now_jst() < end and not event_config["active"]:
+                event_config["active"] = True
                 await set_matching_channel_permission(bot, True)
-                await post_event_notice(bot, f"対戦開始！このチャンネルでマッチングが可能です")
+                await post_event_notice(bot, "対戦開始！このチャンネルでマッチングが可能です")
             elif now_jst() >= end and event_config["active"]:
+                event_config["active"] = False
                 await set_matching_channel_permission(bot, False)
-                await post_event_notice(bot, f"対戦終了！マッチ希望を締め切ります")
+                await post_event_notice(bot, "対戦終了！マッチ希望を締め切ります")
+
         elif event_config["type"] == "long":
             start_date, end_date = event_config["dates"]
             for t_start, t_end in event_config["times"]:
                 today = now_jst().date()
                 if start_date <= today <= end_date:
                     start_dt = datetime.combine(today, t_start, JST)
-                    end_dt   = datetime.combine(today, t_end, JST)
+                    end_dt = datetime.combine(today, t_end, JST)
                     if start_dt <= now_jst() < end_dt and not event_config["active"]:
+                        event_config["active"] = True
                         await set_matching_channel_permission(bot, True)
-                        await post_event_notice(bot, f"対戦開始！このチャンネルでマッチングが可能です")
+                        await post_event_notice(bot, "対戦開始！このチャンネルでマッチングが可能です")
                     elif now_jst() >= end_dt and event_config["active"]:
+                        event_config["active"] = False
                         await set_matching_channel_permission(bot, False)
-                        await post_event_notice(bot, f"対戦終了！マッチ希望を締め切ります")
+                        await post_event_notice(bot, "対戦終了！マッチ希望を締め切ります")
+
         elif event_config["type"] == "unlimited" and not event_config["active"]:
+            event_config["active"] = True
             await set_matching_channel_permission(bot, True)
-            await post_event_notice(bot, f"いつでもマッチング可能です")
+            await post_event_notice(bot, "いつでもマッチング可能です")
+
         await asyncio.sleep(30)  # 30秒ごとにチェック
+
 
 
 # ----------------------------------------
