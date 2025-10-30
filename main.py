@@ -619,7 +619,7 @@ async def cmd_single_event(interaction: discord.Interaction, start: str, end: st
     end_dt   = datetime.strptime(end, "%Y-%m-%d %H:%M").replace(tzinfo=JST)
     event_config.update({"type": "single", "dates": (start_dt, end_dt), "active": False})
 
-    # --- イベント状態を即時反映 ---
+    # --- 現在の時間に応じてチャンネルを制御 ---
     now = now_jst()
     if start_dt <= now < end_dt:
         await set_matching_channel_permission(bot, True)
@@ -632,7 +632,6 @@ async def cmd_single_event(interaction: discord.Interaction, start: str, end: st
 
     await post_event_notice(bot, f"現在のイベント設定🔽\n{start}〜{end}のみマッチング可能です")
     await interaction.response.send_message("単発イベントを設定しました。", ephemeral=True)
-
 
 
 @bot.tree.command(name="長期イベント", description="長期イベント設定")
@@ -658,7 +657,7 @@ async def cmd_long_event(interaction: discord.Interaction, start_date: str, end_
         notice += f"・{s.strftime('%H:%M')}〜{e.strftime('%H:%M')}\n"
     await post_event_notice(bot, notice)
 
-    # --- イベント状態を即時反映 ---
+    # --- 現在の時間に応じてチャンネルを制御 ---
     now = now_jst()
     today = now.date()
     active_now = False
@@ -681,7 +680,6 @@ async def cmd_long_event(interaction: discord.Interaction, start_date: str, end_
     await interaction.response.send_message("長期イベントを設定しました。", ephemeral=True)
 
 
-
 @bot.tree.command(name="無期限イベント", description="無期限イベント設定")
 async def cmd_unlimited_event(interaction: discord.Interaction):
     if interaction.user.id != ADMIN_ID:
@@ -691,6 +689,7 @@ async def cmd_unlimited_event(interaction: discord.Interaction):
     await set_matching_channel_permission(bot, True)
     await post_event_notice(bot, "現在のイベント設定🔽\nいつでもマッチング可能です")
     await interaction.response.send_message("無期限イベントを設定しました。", ephemeral=True)
+
 
 
 # ----------------------------------------
