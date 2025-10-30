@@ -16,84 +16,35 @@ RANKING_CHANNEL_ID = int(os.environ["RANKING_CHANNEL_ID"])
 JUDGE_CHANNEL_ID = int(os.environ["JUDGE_CHANNEL_ID"])
 MATCHING_CHANNEL_ID = int(os.environ["MATCHING_CHANNEL_ID"])
 BATTLELOG_CHANNEL_ID = int(os.environ["BATTLELOG_CHANNEL_ID"])
-BATTLE_CATEGORY_ID = 1427541907579605012  # 固定
-ACTIVE_LOG_CHANNEL_ID = int(os.environ.get("ACTIVE_LOG_CHANNEL_ID", "0"))  # #アクティブ状況 等のログ投稿先
+BATTLE_CATEGORY_ID = 1427541907579605012
+ACTIVE_LOG_CHANNEL_ID = int(os.environ.get("ACTIVE_LOG_CHANNEL_ID", "0"))
 
-# JSTタイムゾーン
 JST = timezone(timedelta(hours=+9))
 AUTO_APPROVE_SECONDS = 300  # 5分
 
 # ----------------------------------------
 # 内部データ
 # ----------------------------------------
-user_data = {}               # user_id -> {"pt": int}
-matching = {}                # 現在マッチ中のプレイヤー組
-waiting_list = {}            # user_id -> {"expires": datetime, "task": asyncio.Task, "interaction": discord.Interaction}
-matching_channels = {}       # user_id -> 専用チャンネルID（v2用）
+user_data = {}           # user_id -> {"pt": int}
+matching = {}            # 現在マッチ中のプレイヤー組
+waiting_list = {}        # user_id -> {"expires": datetime, "task": asyncio.Task, "interaction": discord.Interaction}
+matching_channels = {}   # user_id -> 専用チャンネルID
 
 # ========================================
-# イベントタイマー用データとユーティリティ
+# イベント設定
 # ========================================
-
 event_config = {
     "type": None,        # "single" / "long" / "unlimited"
-    "dates": None,       # 単発 or 長期イベントの日付範囲 (datetime or tuple)
+    "dates": None,       # 単発 or 長期イベントの日付範囲
     "times": None,       # 長期イベントの時間帯リスト [(start, end), ...]
-    "active": False      # 現在マッチング可能か
+    "active": False
 }
 
-# JST対応の現在時刻
 def now_jst():
     return datetime.now(JST)
 
-async def set_matching_channel_permission(bot, allow: bool):
-    channel = bot.get_channel(MATCHING_CHANNEL_ID)
-    if not channel:
-        print("[ERROR] MATCHING_CHANNEL が見つかりません。")
-        return
-
-    guild = channel.guild
-    everyone = guild.default_role
-
-    try:
-        if allow:
-            # 公開: 全員が書き込み可能
-            overwrites = channel.overwrites
-            overwrites[everyone] = discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True
-            )
-            await channel.edit(overwrites=overwrites)
-            print("[イベント制御] MATCHING_CHANNEL を公開しました。")
-        else:
-            # 非公開: Botのみアクセス可能
-            overwrites = {
-                bot.user: discord.PermissionOverwrite(
-                    view_channel=True,
-                    send_messages=True,
-                    read_message_history=True
-                )
-            }
-            await channel.edit(overwrites=overwrites)
-            print("[イベント制御] MATCHING_CHANNEL をプライベート化しました。")
-
-        event_config["active"] = allow
-
-    except Exception as e:
-        print(f"[ERROR] チャンネル公開/非公開切替に失敗しました: {e}")
-
-
-# イベント通知用
-async def post_event_notice(bot, message: str):
-    guild = bot.get_guild(GUILD_ID)
-    ch = guild.get_channel(1427835216830926958)  # #お知らせ
-    if ch:
-        await ch.send(message)
-
-
 # ----------------------------------------
-# ランク定義（表示用）6段階
+# ランク定義
 # ----------------------------------------
 rank_roles = [
     (0, 4, "Beginner", "🔰"),
@@ -160,65 +111,85 @@ def is_registered_match(a: int, b: int):
     return matching.get(a) == b and matching.get(b) == a
 
 # ========================================
+# イベントチャンネル制御
+# ========================================
+async def set_matching_channel_permission(bot, allow: bool):
+    """
+    MATCHING_CHANNEL を一般ユーザー向けに公開／非公開化する
+    allow=True で全員が書き込み可能、False でBot/管理者のみ
+    """
+    channel = bot.get_channel(MATCHING_CHANNEL_ID)
+    if not channel:
+        print("[ERROR] MATCHING_CHANNEL が見つかりません。")
+        return
+
+    guild = channel.guild
+    everyone = guild.default_role
+
+    try:
+        if allow:
+            overwrites = channel.overwrites
+            overwrites[everyone] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True
+            )
+            await channel.edit(overwrites=overwrites)
+            print("[イベント制御] MATCHING_CHANNEL を公開しました。")
+        else:
+            overwrites = {
+                bot.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+                guild.get_member(ADMIN_ID): discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+            }
+            await channel.edit(overwrites=overwrites)
+            print("[イベント制御] MATCHING_CHANNEL をプライベート化しました。")
+
+        event_config["active"] = allow
+
+    except Exception as e:
+        print(f"[ERROR] チャンネル公開/非公開切替に失敗しました: {e}")
+
+async def post_event_notice(bot, message: str):
+    guild = bot.get_guild(GUILD_ID)
+    ch = guild.get_channel(1427835216830926958)  # #お知らせ
+    if ch:
+        await ch.send(message)
+
+# ========================================
 # イベントスケジューラー
 # ========================================
-
-# チャンネル書き込み可否制御
-async def set_matching_channel_permission(bot, allow: bool):
-    """MATCHING_CHANNEL への一般ユーザーの書き込みを許可／禁止する"""
-    guild = bot.get_guild(GUILD_ID)
-    if not guild:
-        return
-    ch = guild.get_channel(MATCHING_CHANNEL_ID)
-    if not ch:
-        return
-    try:
-        overwrite = ch.overwrites_for(guild.default_role)
-        overwrite.send_messages = allow
-        await ch.set_permissions(guild.default_role, overwrite=overwrite)
-        state = "許可" if allow else "禁止"
-        print(f"[イベント制御] MATCHING_CHANNEL への書き込みを {state} にしました。")
-    except Exception as e:
-        print(f"Failed to update MATCHING_CHANNEL permissions: {e}")
-
-
-# イベントスケジューラー本体
 async def event_scheduler_loop(bot):
     await bot.wait_until_ready()
     while True:
+        now = now_jst()
         if event_config["type"] == "single":
             start, end = event_config["dates"]
-            if start <= now_jst() < end and not event_config["active"]:
-                event_config["active"] = True
+            if start <= now < end and not event_config["active"]:
                 await set_matching_channel_permission(bot, True)
                 await post_event_notice(bot, "対戦開始！このチャンネルでマッチングが可能です")
-            elif now_jst() >= end and event_config["active"]:
-                event_config["active"] = False
+            elif now >= end and event_config["active"]:
                 await set_matching_channel_permission(bot, False)
                 await post_event_notice(bot, "対戦終了！マッチ希望を締め切ります")
 
         elif event_config["type"] == "long":
             start_date, end_date = event_config["dates"]
             for t_start, t_end in event_config["times"]:
-                today = now_jst().date()
+                today = now.date()
                 if start_date <= today <= end_date:
                     start_dt = datetime.combine(today, t_start, JST)
                     end_dt = datetime.combine(today, t_end, JST)
-                    if start_dt <= now_jst() < end_dt and not event_config["active"]:
-                        event_config["active"] = True
+                    if start_dt <= now < end_dt and not event_config["active"]:
                         await set_matching_channel_permission(bot, True)
                         await post_event_notice(bot, "対戦開始！このチャンネルでマッチングが可能です")
-                    elif now_jst() >= end_dt and event_config["active"]:
-                        event_config["active"] = False
+                    elif now >= end_dt and event_config["active"]:
                         await set_matching_channel_permission(bot, False)
                         await post_event_notice(bot, "対戦終了！マッチ希望を締め切ります")
 
         elif event_config["type"] == "unlimited" and not event_config["active"]:
-            event_config["active"] = True
             await set_matching_channel_permission(bot, True)
             await post_event_notice(bot, "いつでもマッチング可能です")
 
-        await asyncio.sleep(30)  # 30秒ごとにチェック
+        await asyncio.sleep(30)
 
 
 
@@ -699,9 +670,6 @@ async def cmd_unlimited_event(interaction: discord.Interaction):
 async def on_ready():
     print(f"{bot.user} is ready. Guilds: {[g.name for g in bot.guilds]}")
     await bot.tree.sync()
-
-    # ===== イベントスケジューラー起動 =====
-    # ※ 多重起動防止用にフラグを持つ
     if not hasattr(bot, "event_scheduler_started"):
         bot.event_scheduler_started = True
         asyncio.create_task(event_scheduler_loop(bot))
