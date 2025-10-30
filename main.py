@@ -17,7 +17,7 @@ JUDGE_CHANNEL_ID = int(os.environ["JUDGE_CHANNEL_ID"])
 MATCHING_CHANNEL_ID = int(os.environ["MATCHING_CHANNEL_ID"])
 BATTLELOG_CHANNEL_ID = int(os.environ["BATTLELOG_CHANNEL_ID"])
 BATTLE_CATEGORY_ID = 1427541907579605012  # 固定
-ACTIVE_MSG_ID = 1433015831373287458       # 固定メッセージID
+ACTIVE_LOG_CHANNEL_ID = int(os.environ.get("ACTIVE_LOG_CHANNEL_ID", "0"))  # #アクティブ状況 等のログ投稿先
 
 # JSTタイムゾーン
 JST = timezone(timedelta(hours=+9))
@@ -99,27 +99,30 @@ def is_registered_match(a: int, b: int):
     return matching.get(a) == b and matching.get(b) == a
 
 # ----------------------------------------
-# アクティブ人数更新
+# アクティブ状況ログ投稿（イベント別）
 # ----------------------------------------
-async def update_active_count():
+async def post_active_event(event_type: str):
+    """
+    event_type:
+      - "match_request" : /マッチ希望 が出たとき -> "マッチ希望が出ました"
+      - "match_end"     : 対戦が終了したとき -> "対戦が終了しました"
+    This posts a new message to ACTIVE_LOG_CHANNEL_ID (if set).
+    """
+    if not ACTIVE_LOG_CHANNEL_ID:
+        return
     guild = bot.get_guild(GUILD_ID)
     if not guild:
         return
+    ch = guild.get_channel(ACTIVE_LOG_CHANNEL_ID)
+    if not ch:
+        return
     try:
-        msg_ch = None
-        # メッセージIDからチャンネルを推測する
-        for ch in guild.text_channels:
-            try:
-                msg = await ch.fetch_message(ACTIVE_MSG_ID)
-                msg_ch = ch
-                break
-            except:
-                continue
-        if msg_ch:
-            active_count = len(waiting_list) + len(matching)//2
-            await msg.edit(content=f"現在のアクティブ数：{active_count}名")
+        if event_type == "match_request":
+            await ch.send("マッチ希望が出ました")
+        elif event_type == "match_end":
+            await ch.send("対戦が終了しました")
     except Exception as e:
-        print(f"Failed to update active count: {e}")
+        print(f"Failed to post active event ({event_type}): {e}")
 
 # ----------------------------------------
 # マッチング処理
@@ -146,7 +149,7 @@ async def try_match_users():
             matching[u1] = u2
             matching[u2] = u1
 
-            # 待機タスク削除
+            # 待機タスク削除（ただし interaction は保持しておき、下で編集）
             for uid in [u1, u2]:
                 task = waiting_list[uid]["task"]
                 task.cancel()
@@ -168,11 +171,11 @@ async def try_match_users():
 
             # 降参ボタンを含む初期メッセージ
             await battle_ch.send(
-                f"<@{u1}> vs <@{u2}> のマッチングが成立しました。\n試合終了後、勝者は /勝利報告 を行ってください。",
+                f"<@{u1}> vs <@{u2}> のマッチングが成立しました。\n試合終了後、勝者は /勝利報告 を行ってください。\nこのチャンネルからは降参ボタンで即時敗北申告ができます（押した側が敗北）。",
                 view=ForfeitView(u1, u2, battle_ch.id)
             )
 
-            # 待機メッセージ更新
+            # 待機メッセージ更新（元の ephemeral メッセージの差し替えを試みる）
             for uid in [u1, u2]:
                 interaction = waiting_list.get(uid, {}).get("interaction")
                 if interaction:
@@ -182,12 +185,13 @@ async def try_match_users():
                             view=None
                         )
                     except Exception:
+                        # interaction が無効（ブラウザ更新など）なら無視
                         pass
+                # remove from waiting list now
                 waiting_list.pop(uid, None)
 
             matched.update([u1, u2])
-            # アクティブ数更新
-            await update_active_count()
+            # NOTE: Do not post "match_request" here; we post on request creation.
             break
 
 # ----------------------------------------
@@ -202,7 +206,6 @@ async def remove_waiting(user_id: int):
         except Exception:
             pass
         waiting_list.pop(user_id, None)
-    await update_active_count()
 
 async def waiting_timer(user_id: int):
     try:
@@ -223,14 +226,18 @@ async def start_match_wish(interaction: discord.Interaction):
     waiting_list[uid] = {"expires": datetime.now(JST)+timedelta(seconds=300), "task": task, "interaction": interaction}
     view = CancelWaitingView(uid)
     await interaction.response.send_message("マッチング中です…", ephemeral=True, view=view)
-    # 待機タイマーリセット
-    for uid2, info in waiting_list.items():
+
+    # post a short log to ACTIVE_LOG channel that a match request appeared
+    # (user requested this behavior)
+    asyncio.create_task(post_active_event("match_request"))
+
+    # 待機タイマーリセット（既存の待機ユーザーの timer を再起動）
+    for uid2, info in list(waiting_list.items()):
         info["task"].cancel()
         info["task"] = asyncio.create_task(waiting_timer(uid2))
         info["interaction"] = info.get("interaction", interaction)
     await asyncio.sleep(5)
     await try_match_users()
-    await update_active_count()
 
 # ----------------------------------------
 # /マッチ希望 コマンド & ボタンビュー
@@ -246,7 +253,6 @@ class CancelWaitingView(discord.ui.View):
             waiting_list[self.user_id]["task"].cancel()
             waiting_list.pop(self.user_id, None)
             await interaction.response.send_message("待機リストから削除しました。", ephemeral=True)
-        await update_active_count()
         self.stop()
 
 class RetryView(discord.ui.View):
@@ -284,9 +290,12 @@ class ForfeitView(discord.ui.View):
             return
         winner = self.user2 if uid == self.user1 else self.user1
         loser = uid
+        # 公開で降参通知
         await interaction.response.send_message(f"<@{loser}> が降参しました。<@{winner}> の勝利です。", ephemeral=False)
+        # handle result (this will log to BATTLELOG and remove matching, delete channel, and also post active-event)
         await handle_approved_result(winner, loser, interaction.guild, self.channel_id)
-        await update_active_count()
+        # handle_approved_result will post match_end to ACTIVE_LOG channel,
+        # so no extra post here to avoid duplication.
 
 # ----------------------------------------
 # /勝利報告 コマンド（相手指定不要）
@@ -305,6 +314,7 @@ async def cmd_victory_report(interaction: discord.Interaction):
     content = f"この試合の勝者は <@{winner.id}> です。結果に同意しますか？"
     await interaction.channel.send(content, view=ResultApproveView(winner.id, loser_id, battle_ch_id))
     await interaction.response.send_message("結果報告を受け付けました。敗者の承認を待ちます。", ephemeral=True)
+    # 自動承認タスク（異議が無ければ5分後に自動処理）
     asyncio.create_task(auto_approve_result(winner.id, loser_id, interaction.guild, battle_ch_id))
 
 # ----------------------------------------
@@ -334,7 +344,7 @@ class ResultApproveView(discord.ui.View):
         self.processed = True
         await interaction.response.edit_message(content="承認されました。結果を反映します。", view=None)
         await handle_approved_result(self.winner_id, self.loser_id, interaction.guild, self.battle_ch_id)
-        await update_active_count()
+        # handle_approved_result posts match_end
 
     @discord.ui.button(label="異議", style=discord.ButtonStyle.danger)
     async def dispute(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -349,11 +359,13 @@ class ResultApproveView(discord.ui.View):
         judge_ch = interaction.guild.get_channel(JUDGE_CHANNEL_ID)
         if judge_ch:
             await judge_ch.send(f"⚖️ 審議依頼: <@{self.winner_id}> vs <@{self.loser_id}> に異議が出ました。@<@{ADMIN_ID}> に連絡してください。")
+        # 内部的にマッチ解除（対戦チャンネルは維持）
         matching.pop(self.winner_id, None)
         matching.pop(self.loser_id, None)
         await self.log_battle_result(interaction.guild,
             f"[異議発生] {datetime.now(JST).strftime('%Y-%m-%d %H:%M:%S')} - <@{self.winner_id}> vs <@{self.loser_id}>")
-        await update_active_count()
+        # post that a match ended (by dispute) to ACTIVE_LOG channel
+        asyncio.create_task(post_active_event("match_end"))
 
 # ----------------------------------------
 # 結果反映処理
@@ -375,22 +387,36 @@ async def handle_approved_result(winner_id:int, loser_id:int, guild: discord.Gui
     if l_member:
         await update_member_display(l_member)
 
+    # 内部マッチ削除
     matching.pop(winner_id, None)
     matching.pop(loser_id, None)
 
     log_ch = guild.get_channel(BATTLELOG_CHANNEL_ID)
+    # 対戦ログ記録（勝者確定）
     if log_ch:
-        await log_ch.send(f"[勝者確定] {datetime.now(JST).strftime('%Y-%m-%d %H:%M:%S')} - <@{winner_id}> 勝利 vs <@{loser_id}> 敗北")
+        # include timestamps and mention formatting similar to user's request
+        now_str = datetime.now(JST).strftime('%Y-%m-%d %H:%M:%S')
+        await log_ch.send(f"[勝者確定] {now_str} - <@{winner_id}> 勝利 vs <@{loser_id}> 敗北")
+        delta_w = winner_new - winner_pt
+        delta_l = loser_new - loser_pt
+        await log_ch.send(f"✅ <@{winner_id}> に +{delta_w}pt／<@{loser_id}> に {delta_l}pt の反映を行いました。")
 
+    # 専用チャンネル削除（ただし10秒の事前通知）
     battle_ch = guild.get_channel(battle_ch_id)
     if battle_ch:
-        await battle_ch.delete()
+        try:
+            await battle_ch.send("このチャンネルは自動的に削除されます（10秒後）。")
+        except Exception:
+            pass
+        # wait 10 seconds, then delete
+        await asyncio.sleep(10)
+        try:
+            await battle_ch.delete()
+        except Exception:
+            pass
 
-    delta_w = winner_new - winner_pt
-    delta_l = loser_new - loser_pt
-    if log_ch:
-        await log_ch.send(f"✅ <@{winner_id}> に +{delta_w}pt／<@{loser_id}> に {delta_l}pt の反映を行いました。")
-    await update_active_count()
+    # post active-event: match ended
+    asyncio.create_task(post_active_event("match_end"))
 
 async def auto_approve_result(winner_id:int, loser_id:int, guild: discord.Guild, battle_ch_id:int):
     await asyncio.sleep(AUTO_APPROVE_SECONDS)
@@ -443,7 +469,6 @@ async def admin_set_pt(interaction: discord.Interaction, user: discord.Member, p
     user_data.setdefault(user.id, {})["pt"] = pt
     await update_member_display(user)
     await interaction.response.send_message(f"{user.display_name} のPTを {pt} に設定しました。", ephemeral=True)
-    await update_active_count()
 
 @bot.tree.command(name="admin_reset_all", description="全ユーザーのPTを0にリセット")
 async def admin_reset_all(interaction: discord.Interaction):
@@ -457,7 +482,6 @@ async def admin_reset_all(interaction: discord.Interaction):
         user_data.setdefault(member.id, {})["pt"] = 0
         await update_member_display(member)
     await interaction.response.send_message("全ユーザーのPTを0にリセットしました。", ephemeral=True)
-    await update_active_count()
 
 # ----------------------------------------
 # 起動処理
@@ -466,6 +490,5 @@ async def admin_reset_all(interaction: discord.Interaction):
 async def on_ready():
     print(f"{bot.user} is ready. Guilds: {[g.name for g in bot.guilds]}")
     await bot.tree.sync()
-    await update_active_count()
 
 bot.run(DISCORD_TOKEN)
