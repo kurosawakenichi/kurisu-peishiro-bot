@@ -17,7 +17,7 @@ JUDGE_CHANNEL_ID = int(os.environ["JUDGE_CHANNEL_ID"])
 MATCHING_CHANNEL_ID = int(os.environ["MATCHING_CHANNEL_ID"])
 BATTLELOG_CHANNEL_ID = int(os.environ["BATTLELOG_CHANNEL_ID"])
 BATTLE_CATEGORY_ID = 1427541907579605012  # 固定
-ACTIVE_LOG_CHANNEL_ID = int(os.environ.get("ACTIVE_LOG_CHANNEL_ID", "0"))  # #アクティブ状況 等のログ投稿先
+ACTIVE_LOG_CHANNEL_ID = int(os.environ.get("ACTIVE_LOG_CHANNEL_ID", "0"))
 
 # JSTタイムゾーン
 JST = timezone(timedelta(hours=+9))
@@ -30,6 +30,13 @@ user_data = {}               # user_id -> {"pt": int}
 matching = {}                # 現在マッチ中のプレイヤー組
 waiting_list = {}            # user_id -> {"expires": datetime, "task": asyncio.Task, "interaction": discord.Interaction}
 matching_channels = {}       # user_id -> 専用チャンネルID（v2用）
+
+# イベントタイマー関連
+event_settings = {
+    "type": "unlimited",  # "single", "daily", "unlimited"
+    "periods": [],        # [{"start": datetime, "end": datetime}, ...] 単発／長期共通
+    "daily_times": [],    # [{"start": time, "end": time}, ...] 長期イベント用
+}
 
 # ----------------------------------------
 # ランク定義（表示用）6段階
@@ -102,12 +109,6 @@ def is_registered_match(a: int, b: int):
 # アクティブ状況ログ投稿（イベント別）
 # ----------------------------------------
 async def post_active_event(event_type: str):
-    """
-    event_type:
-      - "match_request" : /マッチ希望 が出たとき -> "マッチ希望が出ました"
-      - "match_end"     : 対戦が終了したとき -> "対戦が終了しました"
-    This posts a new message to ACTIVE_LOG_CHANNEL_ID (if set).
-    """
     if not ACTIVE_LOG_CHANNEL_ID:
         return
     guild = bot.get_guild(GUILD_ID)
@@ -149,7 +150,6 @@ async def try_match_users():
             matching[u1] = u2
             matching[u2] = u1
 
-            # 待機タスク削除（ただし interaction は保持しておき、下で編集）
             for uid in [u1, u2]:
                 task = waiting_list[uid]["task"]
                 task.cancel()
@@ -169,13 +169,11 @@ async def try_match_users():
             matching_channels[u1] = battle_ch.id
             matching_channels[u2] = battle_ch.id
 
-            # 降参ボタンを含む初期メッセージ
             await battle_ch.send(
-                f"<@{u1}> vs <@{u2}> のマッチングが成立しました。\n試合終了後、勝者は /勝利報告 を行ってください。\nこのチャンネルからは降参ボタンで即時敗北申告ができます（押した側が敗北）。",
+                f"<@{u1}> vs <@{u2}> のマッチングが成立しました。\n試合終了後、勝者は /勝利報告 を行ってください。\n降参ボタンで即時敗北申告が可能です。",
                 view=ForfeitView(u1, u2, battle_ch.id)
             )
 
-            # 待機メッセージ更新（元の ephemeral メッセージの差し替えを試みる）
             for uid in [u1, u2]:
                 interaction = waiting_list.get(uid, {}).get("interaction")
                 if interaction:
@@ -185,13 +183,10 @@ async def try_match_users():
                             view=None
                         )
                     except Exception:
-                        # interaction が無効（ブラウザ更新など）なら無視
                         pass
-                # remove from waiting list now
                 waiting_list.pop(uid, None)
 
             matched.update([u1, u2])
-            # NOTE: Do not post "match_request" here; we post on request creation.
             break
 
 # ----------------------------------------
@@ -222,16 +217,38 @@ async def start_match_wish(interaction: discord.Interaction):
     if uid in waiting_list:
         await interaction.response.send_message("すでに待機中です。", ephemeral=True)
         return
+
+    # イベント時間チェック
+    now = datetime.now(JST)
+    can_post = False
+    if event_settings["type"] == "unlimited":
+        can_post = True
+    elif event_settings["type"] == "single":
+        for p in event_settings["periods"]:
+            if p["start"] <= now <= p["end"]:
+                can_post = True
+                break
+    elif event_settings["type"] == "daily":
+        for p in event_settings["periods"]:
+            if p["start"].date() <= now.date() <= p["end"].date():
+                for dt in event_settings["daily_times"]:
+                    start_time = datetime.combine(now.date(), dt["start"])
+                    end_time = datetime.combine(now.date(), dt["end"])
+                    if start_time <= now <= end_time:
+                        can_post = True
+                        break
+    if not can_post:
+        await interaction.response.send_message("現在はマッチング可能時間外です。", ephemeral=True)
+        return
+
     task = asyncio.create_task(waiting_timer(uid))
     waiting_list[uid] = {"expires": datetime.now(JST)+timedelta(seconds=300), "task": task, "interaction": interaction}
     view = CancelWaitingView(uid)
     await interaction.response.send_message("マッチング中です…", ephemeral=True, view=view)
 
-    # post a short log to ACTIVE_LOG channel that a match request appeared
-    # (user requested this behavior)
     asyncio.create_task(post_active_event("match_request"))
 
-    # 待機タイマーリセット（既存の待機ユーザーの timer を再起動）
+    # 待機タイマー再起動
     for uid2, info in list(waiting_list.items()):
         info["task"].cancel()
         info["task"] = asyncio.create_task(waiting_timer(uid2))
@@ -240,7 +257,17 @@ async def start_match_wish(interaction: discord.Interaction):
     await try_match_users()
 
 # ----------------------------------------
-# /マッチ希望 コマンド & ボタンビュー
+# /マッチ希望 コマンド
+# ----------------------------------------
+@bot.tree.command(name="マッチ希望", description="ランダムマッチ希望")
+async def cmd_match_wish(interaction: discord.Interaction):
+    if interaction.channel.id != MATCHING_CHANNEL_ID:
+        await interaction.response.send_message(f"このコマンドは <#{MATCHING_CHANNEL_ID}> でのみ使用可能です。", ephemeral=True)
+        return
+    await start_match_wish(interaction)
+
+# ----------------------------------------
+# ボタンビュー
 # ----------------------------------------
 class CancelWaitingView(discord.ui.View):
     def __init__(self, user_id:int):
@@ -265,16 +292,6 @@ class RetryView(discord.ui.View):
         await start_match_wish(interaction)
         self.stop()
 
-@bot.tree.command(name="マッチ希望", description="ランダムマッチ希望")
-async def cmd_match_wish(interaction: discord.Interaction):
-    if interaction.channel.id != MATCHING_CHANNEL_ID:
-        await interaction.response.send_message(f"このコマンドは <#{MATCHING_CHANNEL_ID}> でのみ使用可能です。", ephemeral=True)
-        return
-    await start_match_wish(interaction)
-
-# ----------------------------------------
-# 降参ボタンビュー（専用チャンネル初期メッセージ用）
-# ----------------------------------------
 class ForfeitView(discord.ui.View):
     def __init__(self, user1:int, user2:int, channel_id:int):
         super().__init__(timeout=None)
@@ -290,15 +307,11 @@ class ForfeitView(discord.ui.View):
             return
         winner = self.user2 if uid == self.user1 else self.user1
         loser = uid
-        # 公開で降参通知
         await interaction.response.send_message(f"<@{loser}> が降参しました。<@{winner}> の勝利です。", ephemeral=False)
-        # handle result (this will log to BATTLELOG and remove matching, delete channel, and also post active-event)
         await handle_approved_result(winner, loser, interaction.guild, self.channel_id)
-        # handle_approved_result will post match_end to ACTIVE_LOG channel,
-        # so no extra post here to avoid duplication.
 
 # ----------------------------------------
-# /勝利報告 コマンド（相手指定不要）
+# /勝利報告 コマンド
 # ----------------------------------------
 @bot.tree.command(name="勝利報告", description="勝者用：対戦結果を報告します")
 async def cmd_victory_report(interaction: discord.Interaction):
@@ -314,7 +327,6 @@ async def cmd_victory_report(interaction: discord.Interaction):
     content = f"この試合の勝者は <@{winner.id}> です。結果に同意しますか？"
     await interaction.channel.send(content, view=ResultApproveView(winner.id, loser_id, battle_ch_id))
     await interaction.response.send_message("結果報告を受け付けました。敗者の承認を待ちます。", ephemeral=True)
-    # 自動承認タスク（異議が無ければ5分後に自動処理）
     asyncio.create_task(auto_approve_result(winner.id, loser_id, interaction.guild, battle_ch_id))
 
 # ----------------------------------------
@@ -344,7 +356,6 @@ class ResultApproveView(discord.ui.View):
         self.processed = True
         await interaction.response.edit_message(content="承認されました。結果を反映します。", view=None)
         await handle_approved_result(self.winner_id, self.loser_id, interaction.guild, self.battle_ch_id)
-        # handle_approved_result posts match_end
 
     @discord.ui.button(label="異議", style=discord.ButtonStyle.danger)
     async def dispute(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -359,12 +370,10 @@ class ResultApproveView(discord.ui.View):
         judge_ch = interaction.guild.get_channel(JUDGE_CHANNEL_ID)
         if judge_ch:
             await judge_ch.send(f"⚖️ 審議依頼: <@{self.winner_id}> vs <@{self.loser_id}> に異議が出ました。結論が出たら<@{ADMIN_ID}> に連絡してください。")
-        # 内部的にマッチ解除（対戦チャンネルは維持）
         matching.pop(self.winner_id, None)
         matching.pop(self.loser_id, None)
         await self.log_battle_result(interaction.guild,
             f"[異議発生] {datetime.now(JST).strftime('%Y-%m-%d %H:%M:%S')} - <@{self.winner_id}> vs <@{self.loser_id}>")
-        # post that a match ended (by dispute) to ACTIVE_LOG channel
         asyncio.create_task(post_active_event("match_end"))
 
 # ----------------------------------------
@@ -387,35 +396,29 @@ async def handle_approved_result(winner_id:int, loser_id:int, guild: discord.Gui
     if l_member:
         await update_member_display(l_member)
 
-    # 内部マッチ削除
     matching.pop(winner_id, None)
     matching.pop(loser_id, None)
 
     log_ch = guild.get_channel(BATTLELOG_CHANNEL_ID)
-    # 対戦ログ記録（勝者確定）
     if log_ch:
-        # include timestamps and mention formatting similar to user's request
         now_str = datetime.now(JST).strftime('%Y-%m-%d %H:%M:%S')
         await log_ch.send(f"[勝者確定] {now_str} - <@{winner_id}> 勝利 vs <@{loser_id}> 敗北")
         delta_w = winner_new - winner_pt
         delta_l = loser_new - loser_pt
         await log_ch.send(f"✅ <@{winner_id}> に +{delta_w}pt／<@{loser_id}> に {delta_l}pt の反映を行いました。")
 
-    # 専用チャンネル削除（ただし10秒の事前通知）
     battle_ch = guild.get_channel(battle_ch_id)
     if battle_ch:
         try:
             await battle_ch.send("このチャンネルは自動的に削除されます（10秒後）。")
         except Exception:
             pass
-        # wait 10 seconds, then delete
         await asyncio.sleep(10)
         try:
             await battle_ch.delete()
         except Exception:
             pass
 
-    # post active-event: match ended
     asyncio.create_task(post_active_event("match_end"))
 
 async def auto_approve_result(winner_id:int, loser_id:int, guild: discord.Guild, battle_ch_id:int):
@@ -458,7 +461,7 @@ async def cmd_ranking(interaction: discord.Interaction):
     await interaction.response.send_message("🏆 ランキング\n" + "\n".join(lines))
 
 # ----------------------------------------
-# 管理コマンド
+# 管理者コマンド
 # ----------------------------------------
 @bot.tree.command(name="admin_set_pt", description="指定ユーザーのPTを設定")
 @app_commands.describe(user="対象ユーザー", pt="設定するPT")
@@ -484,145 +487,55 @@ async def admin_reset_all(interaction: discord.Interaction):
     await interaction.response.send_message("全ユーザーのPTを0にリセットしました。", ephemeral=True)
 
 # ----------------------------------------
-# イベントタイマー管理（単発・長期・無期限）＋開始/終了メッセージ
+# イベントタイマー
 # ----------------------------------------
-
-# 現在のイベント状態をオンメモリで保持
-event_state = {
-    "type": "none",       # none / single / long / unlimited
-    "single": {"start": None, "end": None},           # datetime
-    "long": {"start_date": None, "end_date": None, "time_slots": []},  # time_slots: list of (start_time, end_time)
+event_settings = {
+    "type": "unlimited",  # "single", "daily", "unlimited"
+    "periods": [],         # 単発イベント用
+    "daily_times": []      # 長期イベント用
 }
 
-EVENT_NOTICE_CHANNEL_ID = 1427835216830926958  # お知らせチャンネル
-_event_last_status = None  # None / True(送信可) / False(送信不可) 前回の送信状態を保持
-
-# ヘルパー: イベント通知投稿
-async def post_event_notice(guild: discord.Guild):
-    ch = guild.get_channel(EVENT_NOTICE_CHANNEL_ID)
-    if not ch:
-        return
-    msg_lines = ["現在のイベント設定🔽"]
-    if event_state["type"] == "single":
-        start = event_state["single"]["start"].strftime("%m/%d %H:%M")
-        end = event_state["single"]["end"].strftime("%m/%d %H:%M")
-        msg_lines.append(f"{start}〜{end}のみマッチング可能です")
-    elif event_state["type"] == "long":
-        start_date = event_state["long"]["start_date"].strftime("%m/%d")
-        end_date = event_state["long"]["end_date"].strftime("%m/%d")
-        msg_lines.append(f"{start_date}〜{end_date}の期間中、以下の時間帯のみマッチング可能です")
-        for s, e in event_state["long"]["time_slots"]:
-            msg_lines.append(f"・{s.strftime('%H:%M')}〜{e.strftime('%H:%M')}")
-    elif event_state["type"] == "unlimited":
-        msg_lines.append("いつでもマッチング可能です")
-    await ch.send("\n".join(msg_lines))
-
-# ----------------------------------------
-# /単発イベント
-# ----------------------------------------
-@bot.tree.command(name="単発イベント", description="単発イベントを設定")
-@app_commands.describe(start="開始日時 YYYY/MM/DD/HH:MM", end="終了日時 YYYY/MM/DD/HH:MM")
-async def cmd_single_event(interaction: discord.Interaction, start: str, end: str):
-    if interaction.user.id != ADMIN_ID:
-        await interaction.response.send_message("権限がありません。", ephemeral=True)
-        return
-    start_dt = datetime.strptime(start, "%Y/%m/%d/%H:%M")
-    end_dt   = datetime.strptime(end, "%Y/%m/%d/%H:%M")
-    event_state["type"] = "single"
-    event_state["single"]["start"] = start_dt
-    event_state["single"]["end"] = end_dt
-    await post_event_notice(interaction.guild)
-    await interaction.response.send_message(f"単発イベントを設定しました: {start}〜{end}", ephemeral=True)
-
-# ----------------------------------------
-# /長期イベント
-# ----------------------------------------
-@bot.tree.command(name="長期イベント", description="長期イベントを設定")
-@app_commands.describe(
-    start_date="開始日 YYYY/MM/DD",
-    end_date="終了日 YYYY/MM/DD",
-    time_slots="時間帯 HH:MM-HH:MM をカンマ区切りで指定（例: 21:00-22:00,23:00-23:30）"
-)
-async def cmd_long_event(interaction: discord.Interaction, start_date: str, end_date: str, time_slots: str):
-    if interaction.user.id != ADMIN_ID:
-        await interaction.response.send_message("権限がありません。", ephemeral=True)
-        return
-    s_date = datetime.strptime(start_date, "%Y/%m/%d").date()
-    e_date = datetime.strptime(end_date, "%Y/%m/%d").date()
-    slots = []
-    for slot in time_slots.split(","):
-        start_t, end_t = slot.split("-")
-        s_time = datetime.strptime(start_t.strip(), "%H:%M").time()
-        e_time = datetime.strptime(end_t.strip(), "%H:%M").time()
-        slots.append((s_time, e_time))
-    event_state["type"] = "long"
-    event_state["long"]["start_date"] = s_date
-    event_state["long"]["end_date"] = e_date
-    event_state["long"]["time_slots"] = slots
-    await post_event_notice(interaction.guild)
-    await interaction.response.send_message(f"長期イベントを設定しました: {start_date}〜{end_date} 時間帯: {time_slots}", ephemeral=True)
-
-# ----------------------------------------
-# /無期限イベント
-# ----------------------------------------
-@bot.tree.command(name="無期限イベント", description="無期限イベントを設定")
-async def cmd_unlimited_event(interaction: discord.Interaction):
-    if interaction.user.id != ADMIN_ID:
-        await interaction.response.send_message("権限がありません。", ephemeral=True)
-        return
-    event_state["type"] = "unlimited"
-    await post_event_notice(interaction.guild)
-    await interaction.response.send_message("無期限イベントを設定しました。", ephemeral=True)
-
-# ----------------------------------------
-# チャンネル解放・締め切りタスク + 開始/終了メッセージ
-# ----------------------------------------
 async def event_timer_task():
-    global _event_last_status
     await bot.wait_until_ready()
     guild = bot.get_guild(GUILD_ID)
-    ch = guild.get_channel(MATCHING_CHANNEL_ID)
-    if not ch:
-        return
+    matching_ch = guild.get_channel(MATCHING_CHANNEL_ID)
+    notify_ch = guild.get_channel(1427835216830926958)  # お知らせチャンネル
+
     while True:
         now = datetime.now(JST)
-        can_send = False
-        # 単発イベント
-        if event_state["type"] == "single":
-            start = event_state["single"]["start"]
-            end = event_state["single"]["end"]
-            if start <= now <= end:
-                can_send = True
-        # 長期イベント
-        elif event_state["type"] == "long":
-            today = now.date()
-            if event_state["long"]["start_date"] <= today <= event_state["long"]["end_date"]:
-                for s_time, e_time in event_state["long"]["time_slots"]:
-                    start_dt = datetime.combine(today, s_time)
-                    end_dt   = datetime.combine(today, e_time)
-                    if start_dt <= now <= end_dt:
-                        can_send = True
-                        break
-        # 無期限イベント
-        elif event_state["type"] == "unlimited":
-            can_send = True
-
-        # 権限変更
-        await ch.set_permissions(guild.default_role, send_messages=can_send)
-
-        # 開始/終了メッセージ投稿
-        if _event_last_status != can_send:
-            if can_send:
-                await ch.send("⏰ 対戦時間開始！このチャンネルで /マッチ希望 ができます")
-            else:
-                await ch.send("⏰ 対戦時間終了！ /マッチ希望 を締め切らせていただきます")
-            _event_last_status = can_send
+        can_post = False
+        # 判定
+        if event_settings["type"] == "unlimited":
+            can_post = True
+        elif event_settings["type"] == "single":
+            for p in event_settings["periods"]:
+                if p["start"] <= now <= p["end"]:
+                    can_post = True
+        elif event_settings["type"] == "daily":
+            for p in event_settings["periods"]:
+                if p["start"].date() <= now.date() <= p["end"].date():
+                    for dt in event_settings["daily_times"]:
+                        start_time = datetime.combine(now.date(), dt["start"])
+                        end_time = datetime.combine(now.date(), dt["end"])
+                        if start_time <= now <= end_time:
+                            can_post = True
+        # メッセージ投稿
+        if can_post and not getattr(event_settings, "active", False):
+            try:
+                await matching_ch.send("対戦時間開始！このチャンネルで /マッチ希望 ができます")
+                await notify_ch.send("対戦時間開始！このチャンネルで /マッチ希望 ができます")
+            except Exception:
+                pass
+            event_settings["active"] = True
+        elif not can_post and getattr(event_settings, "active", False):
+            try:
+                await matching_ch.send("対戦時間終了！ /マッチ希望 を締め切らせていただきます")
+                await notify_ch.send("対戦時間終了！ /マッチ希望 を締め切らせていただきます")
+            except Exception:
+                pass
+            event_settings["active"] = False
 
         await asyncio.sleep(30)  # 30秒ごとにチェック
-
-# 起動時にタスクを作成
-bot.loop.create_task(event_timer_task())
-
 
 # ----------------------------------------
 # 起動処理
@@ -631,5 +544,7 @@ bot.loop.create_task(event_timer_task())
 async def on_ready():
     print(f"{bot.user} is ready. Guilds: {[g.name for g in bot.guilds]}")
     await bot.tree.sync()
+    # イベントタイマー開始
+    asyncio.create_task(event_timer_task())
 
 bot.run(DISCORD_TOKEN)
