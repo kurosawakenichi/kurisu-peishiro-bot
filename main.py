@@ -46,14 +46,43 @@ event_config = {
 def now_jst():
     return datetime.now(JST)
 
-# MATCHING_CHANNELの書き込み制御
-async def set_matching_channel_permission(bot, enable: bool):
-    guild = bot.get_guild(GUILD_ID)
-    ch = guild.get_channel(MATCHING_CHANNEL_ID)
-    overwrite = ch.overwrites_for(guild.default_role)
-    overwrite.send_messages = enable
-    await ch.set_permissions(guild.default_role, overwrite=overwrite)
-    event_config["active"] = enable
+async def set_matching_channel_permission(bot, allow: bool):
+    channel = bot.get_channel(MATCHING_CHANNEL_ID)
+    if not channel:
+        print("[ERROR] MATCHING_CHANNEL が見つかりません。")
+        return
+
+    guild = channel.guild
+    everyone = guild.default_role
+
+    try:
+        if allow:
+            # 公開: 全員が書き込み可能
+            overwrites = channel.overwrites
+            overwrites[everyone] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True
+            )
+            await channel.edit(overwrites=overwrites)
+            print("[イベント制御] MATCHING_CHANNEL を公開しました。")
+        else:
+            # 非公開: Botのみアクセス可能
+            overwrites = {
+                bot.user: discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True
+                )
+            }
+            await channel.edit(overwrites=overwrites)
+            print("[イベント制御] MATCHING_CHANNEL をプライベート化しました。")
+
+        event_config["active"] = allow
+
+    except Exception as e:
+        print(f"[ERROR] チャンネル公開/非公開切替に失敗しました: {e}")
+
 
 # イベント通知用
 async def post_event_notice(bot, message: str):
