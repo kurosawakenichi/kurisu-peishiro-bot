@@ -175,10 +175,11 @@ async def post_event_notice(bot, message: str, to_matching_channel: bool = False
 
 
 # ========================================
-# イベントスケジューラー（修正版）
+# イベントスケジューラー（最終修正版）
 # ========================================
 async def event_scheduler_loop(bot):
     await bot.wait_until_ready()
+    notice_ch = bot.get_channel(1427835216830926958)  # #お知らせ
     while True:
         now = now_jst()
 
@@ -186,11 +187,15 @@ async def event_scheduler_loop(bot):
         if event_config["type"] == "single":
             start, end = event_config["dates"]
             if start <= now < end and not event_config["active"]:
+                event_config["active"] = True
                 await set_matching_channel_permission(bot, True)
-                await post_event_notice(bot, "対戦開始！このチャンネルでマッチングが可能です", to_matching_channel=True)
+                if notice_ch:
+                    await notice_ch.send("対戦開始！ #対戦相手募集 でマッチングが可能です")
             elif now >= end and event_config["active"]:
+                event_config["active"] = False
                 await set_matching_channel_permission(bot, False)
-                await post_event_notice(bot, "対戦終了！マッチ希望を締め切ります", to_matching_channel=True)
+                if notice_ch:
+                    await notice_ch.send("対戦終了！マッチ希望を締め切ります")
 
         # 長期イベント（複数時間帯対応）
         elif event_config["type"] == "long":
@@ -209,19 +214,22 @@ async def event_scheduler_loop(bot):
                 if active_in_any and not event_config["active"]:
                     event_config["active"] = True
                     await set_matching_channel_permission(bot, True)
-                    await post_event_notice(bot, "対戦開始！このチャンネルでマッチングが可能です", to_matching_channel=True)
+                    if notice_ch:
+                        await notice_ch.send("対戦開始！ #対戦相手募集 でマッチングが可能です")
                 elif not active_in_any and event_config["active"]:
                     event_config["active"] = False
                     await set_matching_channel_permission(bot, False)
-                    await post_event_notice(bot, "対戦終了！マッチ希望を締め切ります", to_matching_channel=True)
+                    if notice_ch:
+                        await notice_ch.send("対戦終了！マッチ希望を締め切ります")
 
         # 無制限イベント
         elif event_config["type"] == "unlimited" and not event_config["active"]:
+            event_config["active"] = True
             await set_matching_channel_permission(bot, True)
-            await post_event_notice(bot, "いつでもマッチング可能です", to_matching_channel=True)
+            if notice_ch:
+                await notice_ch.send("いつでもマッチング可能です")
 
         await asyncio.sleep(30)
-
 
 
 
@@ -694,6 +702,89 @@ async def cmd_unlimited_event(interaction: discord.Interaction):
     await post_event_notice(bot, "現在のイベント設定🔽\nいつでもマッチング可能です")
     await interaction.response.send_message("無期限イベントを設定しました。", ephemeral=True)
 
+# ========================================
+# Pt受け渡し機能（自動タイムアウト付き）
+# ========================================
+from discord import ui, ButtonStyle, Interaction
+
+class PtTransferView(ui.View):
+    def __init__(self, sender: discord.Member, receiver: discord.Member, timeout_seconds: int = 300):
+        super().__init__(timeout=timeout_seconds)  # デフォルト5分
+        self.sender = sender
+        self.receiver = receiver
+
+    async def on_timeout(self):
+        # ボタン未押下でタイムアウト時に呼ばれる
+        for child in self.children:
+            child.disabled = True  # 全ボタン無効化
+        if self.message:  # メッセージが存在する場合のみ編集
+            await self.message.edit(content=f"⏱ {self.sender.mention} → {self.receiver.mention} のPt譲渡提案は期限切れとなりました。", view=self)
+
+    @ui.button(label="承認", style=ButtonStyle.success)
+    async def approve(self, interaction: Interaction, button: ui.Button):
+        if interaction.user.id != self.receiver.id:
+            await interaction.response.send_message("この操作は対象ユーザーのみ行えます。", ephemeral=True)
+            return
+
+        sender_id = self.sender.id
+        receiver_id = self.receiver.id
+
+        sender_pt = user_data.get(sender_id, {}).get("pt", 0)
+        if sender_pt < 1:
+            await interaction.response.send_message("送信者のPtが不足しています。", ephemeral=True)
+            return
+
+        # Pt送信実行
+        user_data[sender_id]["pt"] -= 1
+        user_data.setdefault(receiver_id, {})["pt"] = user_data.get(receiver_id, {}).get("pt", 0) + 1
+
+        # ユーザー表示更新
+        w_member = interaction.guild.get_member(sender_id)
+        r_member = interaction.guild.get_member(receiver_id)
+        if w_member:
+            await update_member_display(w_member)
+        if r_member:
+            await update_member_display(r_member)
+
+        # メッセージ更新
+        for child in self.children:
+            child.disabled = True
+        await interaction.message.edit(content=f"✅ {self.sender.mention} → {self.receiver.mention} に1pt譲渡が完了しました！", view=self)
+        await interaction.response.send_message("Pt譲渡を承認しました。", ephemeral=True)
+
+    @ui.button(label="拒否", style=ButtonStyle.danger)
+    async def reject(self, interaction: Interaction, button: ui.Button):
+        if interaction.user.id != self.receiver.id:
+            await interaction.response.send_message("この操作は対象ユーザーのみ行えます。", ephemeral=True)
+            return
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.message.edit(content=f"❌ {self.receiver.mention} が譲渡を拒否しました。", view=self)
+        await interaction.response.send_message("Pt譲渡を拒否しました。", ephemeral=True)
+
+
+# /pt送信 コマンド（JUDGEチャンネル専用）
+@bot.tree.command(name="pt送信", description="指定した相手に1pt譲渡を提案します（JUDGEチャンネル専用）")
+async def pt_send(interaction: discord.Interaction, target_user: discord.User):
+    if interaction.channel.id != JUDGE_CHANNEL_ID:
+        await interaction.response.send_message("このコマンドはジャッジチャンネル内でのみ使用できます。", ephemeral=True)
+        return
+
+    sender_id = interaction.user.id
+    if user_data.get(sender_id, {}).get("pt", 0) < 1:
+        await interaction.response.send_message("Ptが不足しています。", ephemeral=True)
+        return
+
+    # 公開メッセージ投稿
+    view = PtTransferView(interaction.user, target_user, timeout_seconds=300)
+    msg = await interaction.response.send_message(
+        f"💰 {interaction.user.mention} が {target_user.mention} に 1pt 譲渡を提案しました！\n"
+        f"{target_user.mention} は下のボタンで承認または拒否してください。",
+        view=view
+    )
+    # Viewに送信メッセージを保持
+    view.message = await msg.original_response()
 
 
 # ----------------------------------------
