@@ -16,23 +16,35 @@ RANKING_CHANNEL_ID = int(os.environ["RANKING_CHANNEL_ID"])
 JUDGE_CHANNEL_ID = int(os.environ["JUDGE_CHANNEL_ID"])
 MATCHING_CHANNEL_ID = int(os.environ["MATCHING_CHANNEL_ID"])
 BATTLELOG_CHANNEL_ID = int(os.environ["BATTLELOG_CHANNEL_ID"])
-BATTLE_CATEGORY_ID = 1427541907579605012  # 固定
-ACTIVE_LOG_CHANNEL_ID = int(os.environ.get("ACTIVE_LOG_CHANNEL_ID", "0"))  # #アクティブ状況 等のログ投稿先
+BATTLE_CATEGORY_ID = 1427541907579605012
+ACTIVE_LOG_CHANNEL_ID = int(os.environ.get("ACTIVE_LOG_CHANNEL_ID", "0"))
 
-# JSTタイムゾーン
 JST = timezone(timedelta(hours=+9))
 AUTO_APPROVE_SECONDS = 300  # 5分
 
 # ----------------------------------------
 # 内部データ
 # ----------------------------------------
-user_data = {}               # user_id -> {"pt": int}
-matching = {}                # 現在マッチ中のプレイヤー組
-waiting_list = {}            # user_id -> {"expires": datetime, "task": asyncio.Task, "interaction": discord.Interaction}
-matching_channels = {}       # user_id -> 専用チャンネルID（v2用）
+user_data = {}           # user_id -> {"pt": int}
+matching = {}            # 現在マッチ中のプレイヤー組
+waiting_list = {}        # user_id -> {"expires": datetime, "task": asyncio.Task, "interaction": discord.Interaction}
+matching_channels = {}   # user_id -> 専用チャンネルID
+
+# ========================================
+# イベント設定
+# ========================================
+event_config = {
+    "type": None,        # "single" / "long" / "unlimited"
+    "dates": None,       # 単発 or 長期イベントの日付範囲
+    "times": None,       # 長期イベントの時間帯リスト [(start, end), ...]
+    "active": False
+}
+
+def now_jst():
+    return datetime.now(JST)
 
 # ----------------------------------------
-# ランク定義（表示用）6段階
+# ランク定義
 # ----------------------------------------
 rank_roles = [
     (0, 4, "Beginner", "🔰"),
@@ -97,6 +109,130 @@ async def update_member_display(member: discord.Member):
 
 def is_registered_match(a: int, b: int):
     return matching.get(a) == b and matching.get(b) == a
+
+# ========================================
+# イベントチャンネル制御
+# ========================================
+async def set_matching_channel_permission(bot, allow: bool):
+    """
+    MATCHING_CHANNEL を一般ユーザー向けに公開／非公開化する
+    allow=True で全員が書き込み可能、False でBot/管理者のみ
+    """
+    channel = bot.get_channel(MATCHING_CHANNEL_ID)
+    if not channel:
+        print("[ERROR] MATCHING_CHANNEL が見つかりません。")
+        return
+
+    guild = channel.guild
+    everyone = guild.default_role
+    admin_member = guild.get_member(ADMIN_ID)
+
+    try:
+        if allow:
+            # 公開: everyone が閲覧・送信可能
+            overwrites = {
+                everyone: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+                bot.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+            }
+            if admin_member:
+                overwrites[admin_member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+            await channel.edit(overwrites=overwrites)
+            print("[イベント制御] MATCHING_CHANNEL を公開しました。")
+        else:
+            # 非公開: everyone は不可、Bot と管理者だけ可
+            overwrites = {
+                everyone: discord.PermissionOverwrite(view_channel=False),
+                bot.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+            }
+            if admin_member:
+                overwrites[admin_member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+            await channel.edit(overwrites=overwrites)
+            print("[イベント制御] MATCHING_CHANNEL をプライベート化しました。")
+
+        event_config["active"] = allow
+
+    except Exception as e:
+        print(f"[ERROR] チャンネル公開/非公開切替に失敗しました: {e}")
+
+
+async def post_event_notice(bot, message: str, to_matching_channel: bool = False):
+    """
+    イベント通知
+    - to_matching_channel=True なら MATCHING_CHANNEL に送信
+    - デフォルトは #お知らせ に送信
+    """
+    guild = bot.get_guild(GUILD_ID)
+    if not guild:
+        return
+
+    if to_matching_channel:
+        ch = guild.get_channel(MATCHING_CHANNEL_ID)
+    else:
+        ch = guild.get_channel(1427835216830926958)  # #お知らせ
+
+    if ch:
+        await ch.send(message)
+
+
+# ========================================
+# イベントスケジューラー（最終修正版）
+# ========================================
+async def event_scheduler_loop(bot):
+    await bot.wait_until_ready()
+    notice_ch = bot.get_channel(1427835216830926958)  # #お知らせ
+    while True:
+        now = now_jst()
+
+        # 単発イベント
+        if event_config["type"] == "single":
+            start, end = event_config["dates"]
+            if start <= now < end and not event_config["active"]:
+                event_config["active"] = True
+                await set_matching_channel_permission(bot, True)
+                if notice_ch:
+                    await notice_ch.send("対戦開始！ #対戦相手募集 でマッチングが可能です")
+            elif now >= end and event_config["active"]:
+                event_config["active"] = False
+                await set_matching_channel_permission(bot, False)
+                if notice_ch:
+                    await notice_ch.send("対戦終了！マッチ希望を締め切ります")
+
+        # 長期イベント（複数時間帯対応）
+        elif event_config["type"] == "long":
+            start_date, end_date = event_config["dates"]
+            today = now.date()
+
+            if start_date <= today <= end_date:
+                active_in_any = False
+                for t_start, t_end in event_config["times"]:
+                    start_dt = datetime.combine(today, t_start, JST)
+                    end_dt = datetime.combine(today, t_end, JST)
+                    if start_dt <= now < end_dt:
+                        active_in_any = True
+                        break  # 1つでも該当時間帯があればOK
+
+                if active_in_any and not event_config["active"]:
+                    event_config["active"] = True
+                    await set_matching_channel_permission(bot, True)
+                    if notice_ch:
+                        await notice_ch.send("対戦開始！ #対戦相手募集 でマッチングが可能です")
+                elif not active_in_any and event_config["active"]:
+                    event_config["active"] = False
+                    await set_matching_channel_permission(bot, False)
+                    if notice_ch:
+                        await notice_ch.send("対戦終了！マッチ希望を締め切ります")
+
+        # 無制限イベント
+        elif event_config["type"] == "unlimited" and not event_config["active"]:
+            event_config["active"] = True
+            await set_matching_channel_permission(bot, True)
+            if notice_ch:
+                await notice_ch.send("いつでもマッチング可能です")
+
+        await asyncio.sleep(30)
+
+
+
 
 # ----------------------------------------
 # アクティブ状況ログ投稿（イベント別）
@@ -483,6 +619,174 @@ async def admin_reset_all(interaction: discord.Interaction):
         await update_member_display(member)
     await interaction.response.send_message("全ユーザーのPTを0にリセットしました。", ephemeral=True)
 
+# /単発イベント /長期イベント /無期限イベント コマンド
+@bot.tree.command(name="単発イベント", description="単発イベント設定")
+@app_commands.describe(start="開始日時 YYYY-MM-DD HH:MM", end="終了日時 YYYY-MM-DD HH:MM")
+async def cmd_single_event(interaction: discord.Interaction, start: str, end: str):
+    if interaction.user.id != ADMIN_ID:
+        await interaction.response.send_message("権限がありません。", ephemeral=True)
+        return
+
+    start_dt = datetime.strptime(start, "%Y-%m-%d %H:%M").replace(tzinfo=JST)
+    end_dt   = datetime.strptime(end, "%Y-%m-%d %H:%M").replace(tzinfo=JST)
+    event_config.update({"type": "single", "dates": (start_dt, end_dt), "active": False})
+
+    # --- 現在の時間に応じてチャンネルを制御 ---
+    now = now_jst()
+    if start_dt <= now < end_dt:
+        await set_matching_channel_permission(bot, True)
+        await post_event_notice(bot, "対戦開始！このチャンネルでマッチングが可能です")
+        event_config["active"] = True
+    else:
+        await set_matching_channel_permission(bot, False)
+        event_config["active"] = False
+    # --------------------------------
+
+    await post_event_notice(bot, f"現在のイベント設定🔽\n{start}〜{end}のみマッチング可能です")
+    await interaction.response.send_message("単発イベントを設定しました。", ephemeral=True)
+
+
+@bot.tree.command(name="長期イベント", description="長期イベント設定")
+@app_commands.describe(start_date="開始日 YYYY-MM-DD", end_date="終了日 YYYY-MM-DD", times="時間帯 HH:MM-HH:MM,複数可カンマ区切り")
+async def cmd_long_event(interaction: discord.Interaction, start_date: str, end_date: str, times: str):
+    if interaction.user.id != ADMIN_ID:
+        await interaction.response.send_message("権限がありません。", ephemeral=True)
+        return
+
+    s_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+    e_date = datetime.strptime(end_date, "%Y-%m-%d").date()
+    time_list = []
+    for t in times.split(","):
+        s, e = t.split("-")
+        s_dt = datetime.strptime(s.strip(), "%H:%M").time()
+        e_dt = datetime.strptime(e.strip(), "%H:%M").time()
+        time_list.append((s_dt, e_dt))
+
+    event_config.update({"type": "long", "dates": (s_date, e_date), "times": time_list, "active": False})
+
+    notice = f"現在のイベント設定🔽\n{start_date}〜{end_date}の期間中、以下の時間帯のみマッチング可能です\n"
+    for s, e in time_list:
+        notice += f"・{s.strftime('%H:%M')}〜{e.strftime('%H:%M')}\n"
+    await post_event_notice(bot, notice)
+
+    # --- 現在の時間に応じてチャンネルを制御 ---
+    now = now_jst()
+    today = now.date()
+    active_now = False
+    if s_date <= today <= e_date:
+        for t_start, t_end in time_list:
+            start_dt = datetime.combine(today, t_start, JST)
+            end_dt = datetime.combine(today, t_end, JST)
+            if start_dt <= now < end_dt:
+                active_now = True
+                break
+    if active_now:
+        await set_matching_channel_permission(bot, True)
+        await post_event_notice(bot, "対戦開始！このチャンネルでマッチングが可能です")
+        event_config["active"] = True
+    else:
+        await set_matching_channel_permission(bot, False)
+        event_config["active"] = False
+    # --------------------------------
+
+    await interaction.response.send_message("長期イベントを設定しました。", ephemeral=True)
+
+
+@bot.tree.command(name="無期限イベント", description="無期限イベント設定")
+async def cmd_unlimited_event(interaction: discord.Interaction):
+    if interaction.user.id != ADMIN_ID:
+        await interaction.response.send_message("権限がありません。", ephemeral=True)
+        return
+    event_config.update({"type": "unlimited", "active": True})
+    await set_matching_channel_permission(bot, True)
+    await post_event_notice(bot, "現在のイベント設定🔽\nいつでもマッチング可能です")
+    await interaction.response.send_message("無期限イベントを設定しました。", ephemeral=True)
+
+# ========================================
+# Pt受け渡し機能（自動タイムアウト付き）
+# ========================================
+from discord import ui, ButtonStyle, Interaction
+
+class PtTransferView(ui.View):
+    def __init__(self, sender: discord.Member, receiver: discord.Member, timeout_seconds: int = 300):
+        super().__init__(timeout=timeout_seconds)  # デフォルト5分
+        self.sender = sender
+        self.receiver = receiver
+
+    async def on_timeout(self):
+        # ボタン未押下でタイムアウト時に呼ばれる
+        for child in self.children:
+            child.disabled = True  # 全ボタン無効化
+        if self.message:  # メッセージが存在する場合のみ編集
+            await self.message.edit(content=f"⏱ {self.sender.mention} → {self.receiver.mention} のPt譲渡提案は期限切れとなりました。", view=self)
+
+    @ui.button(label="承認", style=ButtonStyle.success)
+    async def approve(self, interaction: Interaction, button: ui.Button):
+        if interaction.user.id != self.receiver.id:
+            await interaction.response.send_message("この操作は対象ユーザーのみ行えます。", ephemeral=True)
+            return
+
+        sender_id = self.sender.id
+        receiver_id = self.receiver.id
+
+        sender_pt = user_data.get(sender_id, {}).get("pt", 0)
+        if sender_pt < 1:
+            await interaction.response.send_message("送信者のPtが不足しています。", ephemeral=True)
+            return
+
+        # Pt送信実行
+        user_data[sender_id]["pt"] -= 1
+        user_data.setdefault(receiver_id, {})["pt"] = user_data.get(receiver_id, {}).get("pt", 0) + 1
+
+        # ユーザー表示更新
+        w_member = interaction.guild.get_member(sender_id)
+        r_member = interaction.guild.get_member(receiver_id)
+        if w_member:
+            await update_member_display(w_member)
+        if r_member:
+            await update_member_display(r_member)
+
+        # メッセージ更新
+        for child in self.children:
+            child.disabled = True
+        await interaction.message.edit(content=f"✅ {self.sender.mention} → {self.receiver.mention} に1pt譲渡が完了しました！", view=self)
+        await interaction.response.send_message("Pt譲渡を承認しました。", ephemeral=True)
+
+    @ui.button(label="拒否", style=ButtonStyle.danger)
+    async def reject(self, interaction: Interaction, button: ui.Button):
+        if interaction.user.id != self.receiver.id:
+            await interaction.response.send_message("この操作は対象ユーザーのみ行えます。", ephemeral=True)
+            return
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.message.edit(content=f"❌ {self.receiver.mention} が譲渡を拒否しました。", view=self)
+        await interaction.response.send_message("Pt譲渡を拒否しました。", ephemeral=True)
+
+
+# /pt送信 コマンド（JUDGEチャンネル専用）
+@bot.tree.command(name="pt送信", description="指定した相手に1pt譲渡を提案します（JUDGEチャンネル専用）")
+async def pt_send(interaction: discord.Interaction, target_user: discord.User):
+    if interaction.channel.id != JUDGE_CHANNEL_ID:
+        await interaction.response.send_message("このコマンドはジャッジチャンネル内でのみ使用できます。", ephemeral=True)
+        return
+
+    sender_id = interaction.user.id
+    if user_data.get(sender_id, {}).get("pt", 0) < 1:
+        await interaction.response.send_message("Ptが不足しています。", ephemeral=True)
+        return
+
+    # 公開メッセージ投稿
+    view = PtTransferView(interaction.user, target_user, timeout_seconds=300)
+    msg = await interaction.response.send_message(
+        f"💰 {interaction.user.mention} が {target_user.mention} に 1pt 譲渡を提案しました！\n"
+        f"{target_user.mention} は下のボタンで承認または拒否してください。",
+        view=view
+    )
+    # Viewに送信メッセージを保持
+    view.message = await msg.original_response()
+
+
 # ========================================
 # 管理者専用：待機・対戦リスト初期化コマンド
 # ========================================
@@ -510,6 +814,9 @@ async def admin_reset_waiting(interaction: discord.Interaction):
     await interaction.response.send_message("✅ 全ての待機・対戦リストをリセットしました。", ephemeral=True)
     print("[ADMIN] 全ての待機・対戦リストが管理者によりリセットされました。")
 
+
+
+
 # ----------------------------------------
 # 起動処理
 # ----------------------------------------
@@ -517,5 +824,9 @@ async def admin_reset_waiting(interaction: discord.Interaction):
 async def on_ready():
     print(f"{bot.user} is ready. Guilds: {[g.name for g in bot.guilds]}")
     await bot.tree.sync()
+    if not hasattr(bot, "event_scheduler_started"):
+        bot.event_scheduler_started = True
+        asyncio.create_task(event_scheduler_loop(bot))
+        print("[INFO] イベントスケジューラーを起動しました")
 
 bot.run(DISCORD_TOKEN)
